@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+dist/
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Local agent state — never commit credentials or registration state
+*.crt
+*.key
+*.pem
+registration.json
+agent_id
+buffer.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Go
+vendor/
