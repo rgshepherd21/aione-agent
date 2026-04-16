@@ -1,0 +1,94 @@
+# AI One Agent configuration
+# Environment variables are expanded: ${VAR} or $VAR
+
+agent:
+  # id is populated automatically after registration; do not set manually.
+  # id: ""
+  name: "${HOSTNAME}"
+  install_token: "${AIONE_INSTALL_TOKEN}"
+  data_dir: /var/lib/aione-agent   # Windows: C:\ProgramData\AIOne\Agent
+  heartbeat: 30s
+  tags:
+    - env:production
+
+api:
+  base_url: "https://api.aione.example.com"
+  timeout: 30s
+  retry_max: 5
+  retry_delay: 5s
+
+transport:
+  # cert_file / key_file / ca_file are written automatically at registration.
+  # Override only if you manage certificates externally.
+  # cert_file: /var/lib/aione-agent/agent.crt
+  # key_file:  /var/lib/aione-agent/agent.key
+  # ca_file:   /var/lib/aione-agent/ca.crt
+  insecure_skip_verify: false   # true only for dev/testing
+
+telemetry:
+  snmp:
+    enabled: false
+    interval: 60s
+    targets:
+      - host: 192.168.1.1
+        port: 161
+        community: public
+        version: "2c"
+        oids:
+          - "1.3.6.1.2.1.1.1.0"   # sysDescr
+          - "1.3.6.1.2.1.2.2.1.10" # ifInOctets
+
+  syslog:
+    enabled: false
+    udp_addr: "0.0.0.0:514"
+    tcp_addr: "0.0.0.0:514"
+
+  wmi:
+    enabled: false   # Windows only; ignored on Linux/macOS
+    interval: 30s
+    queries:
+      - name: cpu_load
+        namespace: "root\\cimv2"
+        query: "SELECT LoadPercentage FROM Win32_Processor"
+      - name: disk_space
+        namespace: "root\\cimv2"
+        query: "SELECT FreeSpace, Size, DeviceID FROM Win32_LogicalDisk WHERE DriveType=3"
+      - name: memory
+        namespace: "root\\cimv2"
+        query: "SELECT FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem"
+
+  api_collector:
+    enabled: false
+    interval: 60s
+    endpoints:
+      - name: local_prometheus
+        url: "http://localhost:9090/metrics"
+        method: GET
+        headers:
+          Accept: "application/json"
+
+actions:
+  enabled: true
+  max_concurrent: 5
+  timeout: 5m
+  # hmac_secret: "${AIONE_ACTION_SECRET}"
+  allowed_actions:
+    - run_command
+    - restart_service
+    - collect_diagnostics
+    - apply_config
+
+buffer:
+  enabled: true
+  max_size: 10000
+  # data_file: /var/lib/aione-agent/buffer.json
+
+updater:
+  enabled: true
+  channel: stable   # or "beta"
+  interval: 6h
+
+log:
+  level: info       # trace | debug | info | warn | error
+  pretty: false     # true for human-readable console output
+  # file: /var/log/aione-agent.log
