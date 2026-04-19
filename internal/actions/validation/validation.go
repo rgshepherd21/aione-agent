@@ -1,9 +1,25 @@
 // Package validation verifies action requests before they are executed.
 // It checks: HMAC-SHA256 signature on the request, action type against the
 // operator-configured allowlist, and presence of required parameters.
+//
+// Canonical signing form (MUST match the backend's kal_signer.py):
+//
+//  1. Build a dict with exactly these four keys:
+//     "id", "params", "timeout_seconds", "type"
+//  2. "params" is a string->string dict (may be empty, never null).
+//  3. Serialize to JSON with:
+//     - UTF-8
+//     - keys sorted lexicographically at every nesting level
+//     - no whitespace (compact)
+//     - HTML escaping DISABLED (no \u003c, \u003e, \u0026 escapes)
+//  4. Compute HMAC-SHA256 over those bytes with the shared secret.
+//  5. Hex-encode the MAC.
+//
+// Do not change this format without coordinating with the backend.
 package validation
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -94,20 +110,45 @@ func (v *Validator) checkSignature(a Action) error {
 	return nil
 }
 
-// canonicalBody marshals the action without the Sig field so it can be
-// signed and verified consistently.
-type siglessAction struct {
-	ID      string            `json:"id"`
-	Type    string            `json:"type"`
-	Params  map[string]string `json:"params"`
-	Timeout int               `json:"timeout_seconds"`
-}
-
+// canonicalBody produces the exact byte sequence that both the agent and the
+// backend MUST sign and verify against. See the package doc for the contract.
+//
+// Implementation notes:
+//   - We marshal a map[string]interface{} instead of a struct so that Go's
+//     encoding/json sorts the TOP-LEVEL keys alphabetically (struct fields
+//     would otherwise be serialized in declaration order, which would not
+//     match the Python side's sort_keys=True).
+//   - map[string]string values are also key-sorted by encoding/json.
+//   - We use json.Encoder with SetEscapeHTML(false) because the Go default
+//     escapes <, >, & as \u003c/\u003e/\u0026, which Python does not do.
+//   - json.Encoder appends a trailing newline; we strip it so the output is
+//     byte-identical to Python's json.dumps(..., separators=(',', ':')).
+//   - nil params is normalized to an empty map so the serialized form is
+//     stable regardless of whether the caller passed nil or {}.
 func canonicalBody(a Action) ([]byte, error) {
-	return json.Marshal(siglessAction{
-		ID:      a.ID,
-		Type:    a.Type,
-		Params:  a.Params,
-		Timeout: a.Timeout,
-	})
+	params := a.Params
+	if params == nil {
+		params = map[string]string{}
+	}
+
+	body := map[string]interface{}{
+		"id":              a.ID,
+		"params":          params,
+		"timeout_seconds": a.Timeout,
+		"type":            a.Type,
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(body); err != nil {
+		return nil, err
+	}
+	// Encode() appends a single trailing '\n'; remove it for byte-equality
+	// with compact encoders on other platforms (e.g. Python json.dumps).
+	out := buf.Bytes()
+	if n := len(out); n > 0 && out[n-1] == '\n' {
+		out = out[:n-1]
+	}
+	return out, nil
 }
