@@ -27,3 +27,6 @@ Thumbs.db
 
 # Go
 vendor/
+
+# Windows binaries
+*.exe
