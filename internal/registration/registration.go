@@ -19,24 +19,35 @@ import (
 	"github.com/shepherdtech/aione-agent/internal/transport"
 )
 
-const registrationPath = "/v1/agents/register"
+const registrationPath = "/api/v1/agents/register"
 
 // RegisterRequest is the payload sent to the registration endpoint.
+//
+// Field names and JSON tags mirror the BE schema at
+// app/schemas/agent.py::AgentRegisterRequest. If either side changes,
+// the cross-repo contract regression test (drift doc item #14) should
+// catch the drift before a live run does.
 type RegisterRequest struct {
-	InstallToken string   `json:"install_token"`
-	Hostname     string   `json:"hostname"`
-	OS           string   `json:"os"`
-	Arch         string   `json:"arch"`
-	Version      string   `json:"version"`
-	Tags         []string `json:"tags"`
+	InstallToken string `json:"install_token"`
+	Name         string `json:"name"`
+	AgentVersion string `json:"agent_version"`
+	Platform     string `json:"platform"`
+	Hostname     string `json:"hostname"`
 }
 
 // RegisterResponse is the payload returned by the registration endpoint.
+//
+// Field names and JSON tags mirror the BE schema at
+// app/schemas/agent.py::AgentRegisterResponse. ca_cert_pem is optional
+// (BE ships empty in dev; prod populates from Key Vault).
 type RegisterResponse struct {
-	AgentID string `json:"agent_id"`
-	CertPEM string `json:"cert"`    // PEM-encoded client certificate
-	KeyPEM  string `json:"key"`     // PEM-encoded private key
-	CAPEM   string `json:"ca_cert"` // PEM-encoded server CA bundle
+	AgentID       string                 `json:"agent_id"`
+	TenantID      string                 `json:"tenant_id"`
+	ClientCertPEM string                 `json:"client_cert_pem"`
+	ClientKeyPEM  string                 `json:"client_key_pem"`
+	CACertPEM     string                 `json:"ca_cert_pem"`
+	CertExpiresAt time.Time              `json:"cert_expires_at"`
+	Config        map[string]interface{} `json:"config"`
 }
 
 // stateFile holds persisted registration metadata alongside the certs.
@@ -83,13 +94,18 @@ func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID string, err e
 		hostname = "unknown"
 	}
 
+	// Human-readable name: operator may set via config; fall back to hostname
+	// so a zero-config install still registers with a sensible label.
+	name := r.cfg.Agent.Name
+	if name == "" {
+		name = hostname
+	}
 	req := RegisterRequest{
 		InstallToken: r.cfg.Agent.InstallToken,
+		Name:         name,
+		AgentVersion: r.version,
+		Platform:     runtime.GOOS,
 		Hostname:     hostname,
-		OS:           runtime.GOOS,
-		Arch:         runtime.GOARCH,
-		Version:      r.version,
-		Tags:         r.cfg.Agent.Tags,
 	}
 
 	log.Info().Str("api", r.cfg.API.BaseURL).Msg("registering agent")
@@ -102,12 +118,17 @@ func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID string, err e
 	if resp.AgentID == "" {
 		return "", fmt.Errorf("registration response missing agent_id")
 	}
-	if resp.CertPEM == "" || resp.KeyPEM == "" || resp.CAPEM == "" {
-		return "", fmt.Errorf("registration response missing credential material")
+	if resp.ClientCertPEM == "" || resp.ClientKeyPEM == "" {
+		return "", fmt.Errorf("registration response missing client cert/key material")
+	}
+	if resp.CACertPEM == "" {
+		// BE ships empty ca_cert_pem in dev (by design, see aione-backend PR #26).
+		// Agent falls back to the system trust store for subsequent HTTPS calls.
+		log.Warn().Msg("registration response has empty ca_cert_pem; using system trust store")
 	}
 
 	// Persist credentials to disk.
-	if err := r.store.Save([]byte(resp.CertPEM), []byte(resp.KeyPEM), []byte(resp.CAPEM)); err != nil {
+	if err := r.store.Save([]byte(resp.ClientCertPEM), []byte(resp.ClientKeyPEM), []byte(resp.CACertPEM)); err != nil {
 		return "", fmt.Errorf("saving credentials: %w", err)
 	}
 
