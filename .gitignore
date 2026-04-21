@@ -14,6 +14,10 @@ coverage.html
 registration.json
 agent_id
 buffer.json
+# Local dev config (carries install tokens) + runtime data dir
+config.local.yaml
+*.local.yaml
+agent-data/
 
 # OS
 .DS_Store
