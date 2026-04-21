@@ -149,13 +149,26 @@ func (a *Agent) run(ctx context.Context) error {
 	cfg.Agent.ID = agentID
 
 	// --- Upgrade transport to mTLS ----------------------------------------
+	// In dev (insecure_skip_verify=true), BE ships placeholder strings for
+	// client_cert_pem/client_key_pem (see aione-backend app/api/v1/agents.py),
+	// which fail to parse as PEM. Tolerate that here and fall through to plain
+	// HTTP / skip-verify — prod keeps the hard-fail since real certs are
+	// always minted there.
 	cert, err := store.TLSCertificate()
 	if err != nil {
-		return fmt.Errorf("loading agent certificate: %w", err)
+		if !cfg.Transport.InsecureSkipVerify {
+			return fmt.Errorf("loading agent certificate: %w", err)
+		}
+		log.Warn().Err(err).Msg("agent cert unavailable; continuing without client cert (insecure_skip_verify=true, dev mode)")
+		cert = tls.Certificate{}
 	}
 	caPool, err := store.CACertPool()
 	if err != nil {
-		return fmt.Errorf("loading CA pool: %w", err)
+		if !cfg.Transport.InsecureSkipVerify {
+			return fmt.Errorf("loading CA pool: %w", err)
+		}
+		log.Warn().Err(err).Msg("CA pool unavailable; using system trust (insecure_skip_verify=true, dev mode)")
+		caPool = nil
 	}
 
 	mTLSClient := transport.NewClient(transport.ClientConfig{
@@ -203,9 +216,12 @@ func (a *Agent) run(ctx context.Context) error {
 	wsURL := wsURL(cfg.API.BaseURL, agentID)
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS13,
-		Certificates:       []tls.Certificate{cert},
 		RootCAs:            caPool,
 		InsecureSkipVerify: cfg.Transport.InsecureSkipVerify, //nolint:gosec
+	}
+	// Only attach client cert if we have one (dev mode may have none).
+	if cert.Certificate != nil {
+		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
 
 	wsClient := transport.NewWSClient(wsURL, tlsCfg, agentID, a.version)
