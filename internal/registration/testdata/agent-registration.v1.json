@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "schema": "agent-registration",
+  "source": "aione-backend/app/schemas/agent.py",
+  "models": {
+    "AgentRegisterRequest": {
+      "fields": [
+        "install_token",
+        "name",
+        "description",
+        "agent_version",
+        "platform",
+        "hostname"
+      ],
+      "required": [
+        "install_token",
+        "name",
+        "agent_version",
+        "platform",
+        "hostname"
+      ]
+    },
+    "AgentRegisterResponse": {
+      "fields": [
+        "agent_id",
+        "tenant_id",
+        "client_cert_pem",
+        "client_key_pem",
+        "ca_cert_pem",
+        "cert_expires_at",
+        "config"
+      ],
+      "required": [
+        "agent_id",
+        "tenant_id",
+        "client_cert_pem",
+        "client_key_pem",
+        "cert_expires_at",
+        "config"
+      ]
+    }
+  }
+}
