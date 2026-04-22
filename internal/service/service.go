@@ -18,6 +18,7 @@ import (
 	"github.com/shepherdtech/aione-agent/internal/buffer"
 	"github.com/shepherdtech/aione-agent/internal/config"
 	"github.com/shepherdtech/aione-agent/internal/credentials"
+	"github.com/shepherdtech/aione-agent/internal/dispatcher"
 	"github.com/shepherdtech/aione-agent/internal/heartbeat"
 	"github.com/shepherdtech/aione-agent/internal/registration"
 	"github.com/shepherdtech/aione-agent/internal/telemetry"
@@ -205,12 +206,15 @@ func (a *Agent) run(ctx context.Context) error {
 	mgr.Register(wmi.New(cfg.Telemetry.WMI, agentID))
 	mgr.Register(telapi.New(cfg.Telemetry.API, agentID))
 
-	// --- Action executor --------------------------------------------------
-	exec := executor.New(cfg.Actions, func(result executor.Result) {
-		if err := mTLSClient.PostJSON(ctx, "/v1/agents/action-results", result, nil); err != nil {
-			log.Warn().Err(err).Str("action_id", result.ActionID).Msg("failed to send action result")
-		}
-	})
+	// --- Action executor + command dispatcher -----------------------------
+	// The executor and dispatcher reference each other (dispatcher
+	// submits actions into the executor; executor's result sink posts
+	// results back through the dispatcher). Break the cycle by
+	// constructing the executor with a nil sink, then wiring
+	// SetResultSink after the dispatcher exists.
+	exec := executor.New(cfg.Actions, nil)
+	disp := dispatcher.New(ctx, exec, mTLSClient, agentID)
+	exec.SetResultSink(disp.PostResult)
 
 	// --- WebSocket --------------------------------------------------------
 	wsURL := wsURL(cfg.API.BaseURL, agentID)
@@ -241,7 +245,7 @@ func (a *Agent) run(ctx context.Context) error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		hb := heartbeat.New(cfg, mTLSClient, agentID, a.version)
+		hb := heartbeat.New(cfg, mTLSClient, disp, agentID, a.version)
 		hb.Run(ctx)
 	}()
 

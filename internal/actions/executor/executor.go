@@ -9,6 +9,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,11 +25,17 @@ import (
 )
 
 // Result is the outcome of executing one action.
+//
+// TimedOut is set when the per-action context deadline fired before the
+// underlying work completed. The dispatcher maps this to the backend
+// status "timed_out" (distinct from a generic "failed"), so downstream
+// remediation UX can tell the two apart.
 type Result struct {
 	ActionID  string    `json:"action_id"`
 	Success   bool      `json:"success"`
 	Output    string    `json:"output"`
 	Err       string    `json:"error,omitempty"`
+	TimedOut  bool      `json:"timed_out,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
 }
@@ -46,7 +53,11 @@ type Executor struct {
 }
 
 // New creates an Executor.  sink is called (synchronously within the action
-// goroutine) with each result.
+// goroutine) with each result. Pass nil to defer sink wiring and call
+// SetResultSink later — see the dispatcher wire-up in service.go for
+// why that helps: the dispatcher needs a reference to the executor
+// (for Submit) before the executor can be given a reference to the
+// dispatcher (for PostResult).
 func New(cfg config.ActionsConfig, sink ResultSink) *Executor {
 	sem := make(chan struct{}, cfg.MaxConcurrent)
 	for i := 0; i < cfg.MaxConcurrent; i++ {
@@ -58,6 +69,16 @@ func New(cfg config.ActionsConfig, sink ResultSink) *Executor {
 		sink:      sink,
 		sem:       sem,
 	}
+}
+
+// SetResultSink installs (or replaces) the result sink. Safe to call
+// at most once during startup, before any Submit calls race with
+// execution goroutines. Used to break the executor ↔ dispatcher cycle
+// at construction time.
+func (e *Executor) SetResultSink(sink ResultSink) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sink = sink
 }
 
 // Submit validates and enqueues an action for execution.
@@ -77,12 +98,20 @@ func (e *Executor) Submit(ctx context.Context, action validation.Action) error {
 	go func() {
 		defer func() { e.sem <- struct{}{} }()
 		result := e.execute(ctx, action)
-		if e.sink != nil {
-			e.sink(result)
+		if sink := e.currentSink(); sink != nil {
+			sink(result)
 		}
 	}()
 
 	return nil
+}
+
+// currentSink returns the installed sink under the lock, so concurrent
+// SetResultSink writes don't race with reads in the execute goroutine.
+func (e *Executor) currentSink() ResultSink {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.sink
 }
 
 func (e *Executor) execute(ctx context.Context, action validation.Action) Result {
@@ -113,7 +142,14 @@ func (e *Executor) execute(ctx context.Context, action validation.Action) Result
 	}
 	if err != nil {
 		res.Err = err.Error()
-		log.Warn().Err(err).Str("action_id", action.ID).Msg("action failed")
+		// Distinguish timeout from other failures so the dispatcher can
+		// map it to status="timed_out" on the wire. errors.Is walks the
+		// wrap chain, so a command exec error that wraps the context
+		// deadline still gets classified correctly.
+		if errors.Is(err, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
+			res.TimedOut = true
+		}
+		log.Warn().Err(err).Bool("timed_out", res.TimedOut).Str("action_id", action.ID).Msg("action failed")
 	} else {
 		res.Success = true
 		res.Output = output

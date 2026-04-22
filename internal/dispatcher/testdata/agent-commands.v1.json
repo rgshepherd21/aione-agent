@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "schema": "agent-commands",
+  "source": "aione-backend/app/schemas/agent.py",
+  "models": {
+    "AgentCommand": {
+      "fields": [
+        "command_id",
+        "command_type",
+        "payload",
+        "priority",
+        "expires_at"
+      ],
+      "required": [
+        "command_id",
+        "command_type"
+      ]
+    },
+    "AgentCommandResult": {
+      "fields": [
+        "command_id",
+        "agent_id",
+        "status",
+        "output",
+        "error",
+        "duration_ms",
+        "completed_at"
+      ],
+      "required": [
+        "command_id",
+        "agent_id",
+        "status",
+        "completed_at"
+      ]
+    }
+  }
+}
