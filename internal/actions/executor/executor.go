@@ -168,6 +168,10 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 		return e.collectDiagnostics(ctx)
 	case "apply_config":
 		return e.applyConfig(ctx, action.Params)
+	case "flush_dns_cache":
+		// KAL action seeded by aione-backend migration 021. Executor
+		// lives in flush_dns_cache.go in this package.
+		return e.flushDNSCache(ctx, action.Params)
 	default:
 		return "", fmt.Errorf("unknown action type: %s", action.Type)
 	}

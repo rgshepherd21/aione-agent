@@ -52,6 +52,22 @@ func TestCanonicalBody_GoldenFormat(t *testing.T) {
 			},
 			expected: `{"id":"act-003","params":{"cmd":"echo <ok> & done"},"timeout_seconds":5,"type":"run_command"}`,
 		},
+		{
+			// Cross-repo golden vector: MUST stay byte-identical to the
+			// GOLDEN_CANONICAL_BODY fixture in
+			// aione-backend/tests/test_flush_dns_cache_action.py (task
+			// #16). The matching backend test pins the same bytes from
+			// the Python signer side; if these two drift the agent will
+			// reject every flush_dns_cache command with ErrBadSignature.
+			name: "flush_dns_cache with empty params (KAL seed shape)",
+			action: Action{
+				ID:      "flush_dns_cache",
+				Type:    "flush_dns_cache",
+				Params:  map[string]string{},
+				Timeout: 10,
+			},
+			expected: `{"id":"flush_dns_cache","params":{},"timeout_seconds":10,"type":"flush_dns_cache"}`,
+		},
 	}
 
 	for _, tc := range cases {
