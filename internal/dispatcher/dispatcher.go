@@ -174,8 +174,13 @@ func (d *Dispatcher) Deliver(cmds []PendingCommand) []string {
 func (d *Dispatcher) PostResult(r executor.Result) {
 	res := buildResult(r, d.agentID)
 
-	// Clear dedup entry — the command is fully settled.
-	d.forget(r.ActionID)
+	// Clear dedup entry — the command is fully settled. Dedup is keyed on
+	// the outer command_id (see markSeen(cmd.CommandID)), NOT the KAL
+	// action slug: two separate dispatches of the same action need
+	// distinct dedup entries, and ActionID collides. Historically this
+	// used r.ActionID, which leaked entries forever; we now forget by
+	// the correlation id the dispatcher threaded through.
+	d.forget(res.CommandID)
 
 	if err := d.client.PostJSON(d.ctx, commandResultsPath, res, nil); err != nil {
 		log.Warn().
@@ -289,6 +294,11 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 		Params:  params,
 		Timeout: timeout,
 		Sig:     sig,
+		// Correlation id the backend will use to locate the ActionExecution
+		// row on command-results writeback. Distinct from the KAL action
+		// slug in `id`; see the Action struct doc for why this field is
+		// off-wire / off-signature.
+		CommandID: cmd.CommandID,
 	}, nil
 }
 
@@ -312,8 +322,16 @@ func buildResult(r executor.Result, agentID string) CommandResult {
 		}
 	}
 
+	// Prefer the correlation id the dispatcher threaded through from the
+	// outer AgentCommand envelope. Fall back to ActionID only so callers
+	// that bypass the dispatcher (older tests, synthesized results) still
+	// round-trip *something* — in production, CommandID is always set.
+	cmdID := r.CommandID
+	if cmdID == "" {
+		cmdID = r.ActionID
+	}
 	res := CommandResult{
-		CommandID:   r.ActionID,
+		CommandID:   cmdID,
 		AgentID:     agentID,
 		Status:      status,
 		CompletedAt: r.EndedAt,

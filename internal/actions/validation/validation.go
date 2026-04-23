@@ -30,12 +30,23 @@ import (
 )
 
 // Action is the structure sent by the AI One API to trigger work on the agent.
+//
+// CommandID is the per-dispatch correlation id (the outer AgentCommand.command_id
+// from the heartbeat payload). It is distinct from ID, which is the reusable
+// KAL action slug (e.g. "flush_dns_cache") used for type dispatch and included
+// in the signed canonical body. CommandID intentionally carries `json:"-"`
+// because (1) it rides on the outer AgentCommand envelope on the wire, not
+// inside the signed KAL action body, and (2) canonicalBody below builds its
+// own map[string]interface{}, so adding this field does not change the bytes
+// that feed HMAC-SHA256 — signatures computed before this field existed still
+// verify.
 type Action struct {
-	ID      string            `json:"id"`
-	Type    string            `json:"type"`   // e.g. "run_command", "restart_service"
-	Params  map[string]string `json:"params"` // Action-specific key/value parameters
-	Timeout int               `json:"timeout_seconds"`
-	Sig     string            `json:"sig"` // hex-encoded HMAC-SHA256 over canonical JSON
+	ID        string            `json:"id"`
+	Type      string            `json:"type"`   // e.g. "run_command", "restart_service"
+	Params    map[string]string `json:"params"` // Action-specific key/value parameters
+	Timeout   int               `json:"timeout_seconds"`
+	Sig       string            `json:"sig"` // hex-encoded HMAC-SHA256 over canonical JSON
+	CommandID string            `json:"-"`   // outer AgentCommand.command_id; off-wire, off-signature
 }
 
 // ErrNotAllowed is returned when the action type is not in the allowlist.
