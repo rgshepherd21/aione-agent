@@ -51,16 +51,22 @@ type RegisterResponse struct {
 }
 
 // stateFile holds persisted registration metadata alongside the certs.
+//
+// TenantID landed in the struct post-#26 so the agent can thread tenant
+// scope into downstream components (state-capture posting). Older state
+// files that pre-date the field decode with TenantID="" which callers
+// guard on before enabling tenant-gated features.
 type stateFile struct {
-	AgentID     string    `json:"agent_id"`
+	AgentID      string    `json:"agent_id"`
+	TenantID     string    `json:"tenant_id"`
 	RegisteredAt time.Time `json:"registered_at"`
 }
 
 // Registrar manages the registration lifecycle.
 type Registrar struct {
-	cfg   *config.Config
-	store *credentials.Store
-	client *transport.Client
+	cfg     *config.Config
+	store   *credentials.Store
+	client  *transport.Client
 	version string
 }
 
@@ -78,15 +84,20 @@ func New(cfg *config.Config, store *credentials.Store, client *transport.Client,
 // EnsureRegistered performs registration if the agent hasn't been registered
 // yet, or if credentials are missing.  It is idempotent: a second call when
 // credentials are already present does nothing.
-func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID string, err error) {
+//
+// Returns agentID + tenantID so the caller can thread the tenant scope
+// into downstream components (state-capture posting, audit headers). A
+// zero tenantID is allowed from a legacy state file that pre-dates the
+// field being persisted -- the caller should guard on it.
+func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID, tenantID string, err error) {
 	// Check for existing state first.
-	if id, ok := r.loadState(); ok && r.store.Exists() {
+	if id, tid, ok := r.loadState(); ok && r.store.Exists() {
 		log.Info().Str("agent_id", id).Msg("agent already registered")
-		return id, nil
+		return id, tid, nil
 	}
 
 	if r.cfg.Agent.InstallToken == "" {
-		return "", fmt.Errorf("agent.install_token is required for first-time registration")
+		return "", "", fmt.Errorf("agent.install_token is required for first-time registration")
 	}
 
 	hostname, err := os.Hostname()
@@ -112,14 +123,14 @@ func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID string, err e
 
 	var resp RegisterResponse
 	if err := r.client.PostJSON(ctx, registrationPath, req, &resp); err != nil {
-		return "", fmt.Errorf("registration API call: %w", err)
+		return "", "", fmt.Errorf("registration API call: %w", err)
 	}
 
 	if resp.AgentID == "" {
-		return "", fmt.Errorf("registration response missing agent_id")
+		return "", "", fmt.Errorf("registration response missing agent_id")
 	}
 	if resp.ClientCertPEM == "" || resp.ClientKeyPEM == "" {
-		return "", fmt.Errorf("registration response missing client cert/key material")
+		return "", "", fmt.Errorf("registration response missing client cert/key material")
 	}
 	if resp.CACertPEM == "" {
 		// BE ships empty ca_cert_pem in dev (by design, see aione-backend PR #26).
@@ -129,41 +140,45 @@ func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID string, err e
 
 	// Persist credentials to disk.
 	if err := r.store.Save([]byte(resp.ClientCertPEM), []byte(resp.ClientKeyPEM), []byte(resp.CACertPEM)); err != nil {
-		return "", fmt.Errorf("saving credentials: %w", err)
+		return "", "", fmt.Errorf("saving credentials: %w", err)
 	}
 
 	// Persist registration state.
-	if err := r.saveState(resp.AgentID); err != nil {
+	if err := r.saveState(resp.AgentID, resp.TenantID); err != nil {
 		log.Warn().Err(err).Msg("could not persist registration state")
 	}
 
 	log.Info().Str("agent_id", resp.AgentID).Msg("registration successful")
-	return resp.AgentID, nil
+	return resp.AgentID, resp.TenantID, nil
 }
 
 func (r *Registrar) statePath() string {
 	return filepath.Join(r.cfg.Agent.DataDir, "registration.json")
 }
 
-func (r *Registrar) saveState(agentID string) error {
+func (r *Registrar) saveState(agentID, tenantID string) error {
 	if err := os.MkdirAll(r.cfg.Agent.DataDir, 0o700); err != nil {
 		return err
 	}
-	data, err := json.Marshal(stateFile{AgentID: agentID, RegisteredAt: time.Now()})
+	data, err := json.Marshal(stateFile{
+		AgentID:      agentID,
+		TenantID:     tenantID,
+		RegisteredAt: time.Now(),
+	})
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(r.statePath(), data, 0o600)
 }
 
-func (r *Registrar) loadState() (string, bool) {
+func (r *Registrar) loadState() (string, string, bool) {
 	data, err := os.ReadFile(r.statePath())
 	if err != nil {
-		return "", false
+		return "", "", false
 	}
 	var s stateFile
 	if err := json.Unmarshal(data, &s); err != nil {
-		return "", false
+		return "", "", false
 	}
-	return s.AgentID, s.AgentID != ""
+	return s.AgentID, s.TenantID, s.AgentID != ""
 }

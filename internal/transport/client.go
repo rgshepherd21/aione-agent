@@ -29,8 +29,8 @@ type ClientConfig struct {
 
 // Client is a mTLS-capable HTTP client with retry logic.
 type Client struct {
-	cfg    ClientConfig
-	http   *http.Client
+	cfg     ClientConfig
+	http    *http.Client
 	agentID string
 	version string
 }

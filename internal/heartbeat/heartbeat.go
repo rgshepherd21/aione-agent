@@ -46,10 +46,10 @@ type Payload struct {
 // shape is shared between the two paths); the contract_test there
 // verifies parity with the canonical schema export.
 type HeartbeatResponse struct {
-	ReceivedAt      time.Time                     `json:"received_at"`
-	PendingCommands []dispatcher.PendingCommand   `json:"pending_commands"`
-	KALRulesVersion *string                       `json:"kal_rules_version,omitempty"`
-	KALRulesStale   bool                          `json:"kal_rules_stale"`
+	ReceivedAt      time.Time                   `json:"received_at"`
+	PendingCommands []dispatcher.PendingCommand `json:"pending_commands"`
+	KALRulesVersion *string                     `json:"kal_rules_version,omitempty"`
+	KALRulesStale   bool                        `json:"kal_rules_stale"`
 }
 
 // Runner sends heartbeats on a fixed interval until the context is cancelled.

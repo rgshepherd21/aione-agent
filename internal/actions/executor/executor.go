@@ -21,6 +21,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/shepherdtech/aione-agent/internal/actions/validation"
+	"github.com/shepherdtech/aione-agent/internal/capture"
 	"github.com/shepherdtech/aione-agent/internal/config"
 )
 
@@ -50,6 +51,14 @@ type Executor struct {
 	sink      ResultSink
 	sem       chan struct{}
 	mu        sync.Mutex
+
+	// Capture context -- set post-registration via SetCaptureContext.
+	// When capturePoster is nil the per-action capture bracket is a
+	// no-op so this works incrementally: the first action to opt into
+	// bracketing gets it; bare actions stay bare.
+	agentID       string
+	tenantID      string
+	capturePoster CapturePoster
 }
 
 // New creates an Executor.  sink is called (synchronously within the action
@@ -170,8 +179,15 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 		return e.applyConfig(ctx, action.Params)
 	case "flush_dns_cache":
 		// KAL action seeded by aione-backend migration 021. Executor
-		// lives in flush_dns_cache.go in this package.
-		return e.flushDNSCache(ctx, action.Params)
+		// lives in flush_dns_cache.go in this package. Bracketed with
+		// pre/post state captures via captureDNSState (see captures.go)
+		// so the rollback pipeline has a before/after snapshot. Capture
+		// failures are logged and swallowed -- the action's own success
+		// is not coupled to capture-pipeline health.
+		e.captureDNSState(ctx, action.ID, capture.CaptureTypePre)
+		out, err := e.flushDNSCache(ctx, action.Params)
+		e.captureDNSState(ctx, action.ID, capture.CaptureTypePost)
+		return out, err
 	default:
 		return "", fmt.Errorf("unknown action type: %s", action.Type)
 	}
@@ -278,4 +294,3 @@ func (e *Executor) applyConfig(ctx context.Context, params map[string]string) (s
 
 	return fmt.Sprintf("wrote %d bytes to %s", len(content), path), nil
 }
-
