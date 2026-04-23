@@ -195,9 +195,13 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 		// so the rollback pipeline has a before/after snapshot. Capture
 		// failures are logged and swallowed -- the action's own success
 		// is not coupled to capture-pipeline health.
-		e.captureDNSState(ctx, action.ID, capture.CaptureTypePre)
+		// Pass action.CommandID (the per-dispatch correlation id that
+		// equals action_executions.id on the backend) -- NOT action.ID
+		// (the KAL action slug). The state-captures endpoint validates
+		// action_execution_id as a UUID; sending a slug 422s the POST.
+		e.captureDNSState(ctx, action.CommandID, capture.CaptureTypePre)
 		out, err := e.flushDNSCache(ctx, action.Params)
-		e.captureDNSState(ctx, action.ID, capture.CaptureTypePost)
+		e.captureDNSState(ctx, action.CommandID, capture.CaptureTypePost)
 		return out, err
 	default:
 		return "", fmt.Errorf("unknown action type: %s", action.Type)
