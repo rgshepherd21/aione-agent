@@ -1,0 +1,128 @@
+name: Release
+
+# Triggers on semver tags (v1.2.3, v0.1.0-beta.1, etc.) — cuts a GitHub
+# Release and uploads multi-arch binaries + SHA-256 checksums.
+#
+# Tag workflow:
+#   git tag v0.1.0
+#   git push --tags
+#
+# Build flags:
+#   -trimpath            strip absolute repo paths from the binary
+#   -ldflags "-s -w ..." strip symbol table + DWARF, inject version/sha/date
+#   CGO_ENABLED=0        fully-static binaries — run anywhere without libc deps
+#
+# For the Phase A distribution path (minimal, alpha). Code signing is NOT
+# wired here — SmartScreen warning on Windows is acceptable for alpha. When
+# we add Authenticode / GPG signing (Phase B), extend each build step with
+# a sign-after-build action and attach signatures alongside checksums.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write  # needed to create release + upload assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ''
+          - goos: linux
+            goarch: arm64
+            ext: ''
+          - goos: windows
+            goarch: amd64
+            ext: '.exe'
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+
+      - name: Module hygiene (go mod download + verify)
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          SHA="${GITHUB_SHA}"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          OUT="aione-agent-${VERSION}-${GOOS}-${GOARCH}${{ matrix.ext }}"
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.gitCommit=${SHA} -X main.buildTime=${DATE}" \
+            -o "${OUT}" ./cmd/agent
+          sha256sum "${OUT}" > "${OUT}.sha256"
+          ls -la "${OUT}" "${OUT}.sha256"
+          echo "BINARY=${OUT}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY }}
+          path: |
+            ${{ env.BINARY }}
+            ${{ env.BINARY }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifact tree
+        run: |
+          mkdir -p release
+          find dist -type f -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## aione-agent ${{ github.ref_name }}
+
+            Alpha-stage agent binaries. See
+            [docs/install.md](../blob/${{ github.ref_name }}/docs/install.md)
+            for the install walkthrough.
+
+            **This release is not code-signed.** Windows SmartScreen may warn
+            on first run — click "More info" → "Run anyway." Linux binaries
+            are unsigned; verify via the published SHA-256 checksum.
+
+            Full changelog auto-generated below.
