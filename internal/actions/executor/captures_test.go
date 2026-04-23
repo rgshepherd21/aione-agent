@@ -131,9 +131,16 @@ func TestDispatchFlushDNSCacheWrapsWithBrackets(t *testing.T) {
 	poster := &recordingPoster{}
 	e.SetCaptureContext("agent-1", "tenant-1", poster)
 
+	// dispatch now threads action.CommandID (the per-dispatch correlation
+	// id) -- not action.ID (the KAL action slug) -- into captureDNSState,
+	// because the backend's state-captures endpoint validates
+	// action_execution_id as a UUID and rejects slugs. So the test sets
+	// CommandID to the value we expect to land on the wire, and ID to the
+	// action slug the dispatch switch actually keys off.
 	_, _ = e.dispatch(context.Background(), validation.Action{
-		ID:   "exec-42",
-		Type: "flush_dns_cache",
+		ID:        "flush_dns_cache",
+		CommandID: "exec-42",
+		Type:      "flush_dns_cache",
 	})
 
 	got := poster.snapshot()
