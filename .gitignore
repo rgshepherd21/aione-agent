@@ -14,8 +14,9 @@ coverage.html
 registration.json
 agent_id
 buffer.json
-# Local dev config (carries install tokens) + runtime data dir
-config.local.yaml
+# Local dev config (carries install tokens / env overrides) + runtime data dir
+# Matches config.local.yaml, config.azure.yaml, config.prod.yaml, etc.
+config.*.yaml
 *.local.yaml
 agent-data/
 
