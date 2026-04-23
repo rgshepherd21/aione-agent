@@ -16,6 +16,7 @@ import (
 	"github.com/shepherdtech/aione-agent/internal/actions/executor"
 	"github.com/shepherdtech/aione-agent/internal/actions/validation"
 	"github.com/shepherdtech/aione-agent/internal/buffer"
+	"github.com/shepherdtech/aione-agent/internal/capture"
 	"github.com/shepherdtech/aione-agent/internal/config"
 	"github.com/shepherdtech/aione-agent/internal/credentials"
 	"github.com/shepherdtech/aione-agent/internal/dispatcher"
@@ -143,7 +144,7 @@ func (a *Agent) run(ctx context.Context) error {
 
 	// --- Registration ------------------------------------------------------
 	reg := registration.New(cfg, store, preClient, a.version)
-	agentID, err := reg.EnsureRegistered(ctx)
+	agentID, tenantID, err := reg.EnsureRegistered(ctx)
 	if err != nil {
 		return fmt.Errorf("registration: %w", err)
 	}
@@ -215,6 +216,18 @@ func (a *Agent) run(ctx context.Context) error {
 	exec := executor.New(cfg.Actions, nil)
 	disp := dispatcher.New(ctx, exec, mTLSClient, agentID)
 	exec.SetResultSink(disp.PostResult)
+
+	// --- State-capture poster --------------------------------------------
+	// Wire the capture-bracket path into the executor. With this wired,
+	// flush_dns_cache (and any future bracketed action) ships pre/post
+	// Capture rows to /api/v1/agents/state-captures. A zero tenantID
+	// leaves capture disabled -- legacy state files that pre-date the
+	// tenant_id field land here without a crash.
+	if tenantID != "" {
+		exec.SetCaptureContext(agentID, tenantID, capture.NewPoster(mTLSClient))
+	} else {
+		log.Warn().Msg("no tenant_id from registration; capture bracket disabled")
+	}
 
 	// --- WebSocket --------------------------------------------------------
 	wsURL := wsURL(cfg.API.BaseURL, agentID)

@@ -104,10 +104,10 @@ func TestRunSucceeds(t *testing.T) {
 	req.CaptureSource = "ipconfig /displaydns"
 
 	payload := map[string]any{
-		"hostname":     "sheptech-win-01",
-		"entry_count":  3,
-		"tcp_enabled":  true,
-		"resolver":     "1.1.1.1",
+		"hostname":    "sheptech-win-01",
+		"entry_count": 3,
+		"tcp_enabled": true,
+		"resolver":    "1.1.1.1",
 	}
 
 	got, err := RunAt(context.Background(), req, okCollector(payload), fixedTime)
