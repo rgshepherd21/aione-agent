@@ -137,6 +137,67 @@ func TestValidate_RejectsTamperedParams(t *testing.T) {
 	}
 }
 
+// TestCanonicalBody_IgnoresCommandID pins the invariant that powers the
+// dispatcher's CommandID propagation: the off-wire CommandID field on
+// Action must NOT change the bytes that feed HMAC-SHA256. Otherwise
+// threading the backend's outer command_id through the agent would
+// invalidate every existing signature from kal_signer.py.
+func TestCanonicalBody_IgnoresCommandID(t *testing.T) {
+	base := Action{
+		ID:      "flush_dns_cache",
+		Type:    "flush_dns_cache",
+		Params:  map[string]string{},
+		Timeout: 10,
+	}
+	withCmdID := base
+	withCmdID.CommandID = "daadb133-1ff0-4c12-bdc9-22db8cc24025"
+
+	gotBase, err := canonicalBody(base)
+	if err != nil {
+		t.Fatalf("canonicalBody(base): %v", err)
+	}
+	gotWith, err := canonicalBody(withCmdID)
+	if err != nil {
+		t.Fatalf("canonicalBody(withCmdID): %v", err)
+	}
+	if string(gotBase) != string(gotWith) {
+		t.Errorf(
+			"CommandID leaked into canonical body\n  base: %s\n  with: %s",
+			string(gotBase), string(gotWith),
+		)
+	}
+}
+
+// TestValidate_AcceptsSignatureRegardlessOfCommandID is the Validate-path
+// complement to the canonical-body test: a signature computed before
+// CommandID is set must still verify after the dispatcher populates it.
+func TestValidate_AcceptsSignatureRegardlessOfCommandID(t *testing.T) {
+	secret := "test-secret-do-not-use-in-prod"
+	v := New(config.ActionsConfig{
+		HMACSecret:     secret,
+		AllowedActions: []string{"flush_dns_cache"},
+	})
+
+	a := Action{
+		ID:      "flush_dns_cache",
+		Type:    "flush_dns_cache",
+		Params:  map[string]string{},
+		Timeout: 10,
+	}
+	body, _ := canonicalBody(a)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	a.Sig = hex.EncodeToString(mac.Sum(nil))
+
+	// Mimic dispatcher.buildAction stamping the outer command_id after
+	// the backend has already signed the body.
+	a.CommandID = "daadb133-1ff0-4c12-bdc9-22db8cc24025"
+
+	if err := v.Validate(a); err != nil {
+		t.Fatalf("Validate rejected action after CommandID stamp: %v", err)
+	}
+}
+
 func TestValidate_RejectsDisallowedActionType(t *testing.T) {
 	v := New(config.ActionsConfig{
 		HMACSecret:     "", // signature check skipped so we isolate allowlist logic

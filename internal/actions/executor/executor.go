@@ -31,8 +31,18 @@ import (
 // underlying work completed. The dispatcher maps this to the backend
 // status "timed_out" (distinct from a generic "failed"), so downstream
 // remediation UX can tell the two apart.
+//
+// CommandID vs. ActionID: ActionID is the KAL action slug ("flush_dns_cache")
+// -- stable across every dispatch of that action, used for type dispatch and
+// capture bracketing. CommandID is the per-dispatch correlation id carried
+// on the outer AgentCommand envelope, unique to this one execution. The
+// dispatcher's buildResult wires CommandID through to the wire-level
+// CommandResult.command_id the backend uses to locate the owning
+// ActionExecution row. ActionID is preserved for log context / dedup paths
+// that key off action type.
 type Result struct {
 	ActionID  string    `json:"action_id"`
+	CommandID string    `json:"command_id,omitempty"`
 	Success   bool      `json:"success"`
 	Output    string    `json:"output"`
 	Err       string    `json:"error,omitempty"`
@@ -146,6 +156,7 @@ func (e *Executor) execute(ctx context.Context, action validation.Action) Result
 
 	res := Result{
 		ActionID:  action.ID,
+		CommandID: action.CommandID,
 		StartedAt: start,
 		EndedAt:   time.Now(),
 	}
