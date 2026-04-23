@@ -5,6 +5,7 @@
 package credentials
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
@@ -77,10 +78,26 @@ func (s *Store) TLSCertificate() (tls.Certificate, error) {
 }
 
 // CACertPool loads the server CA PEM and returns a cert pool.
+//
+// An empty (zero-byte) or whitespace-only ca.crt is a legitimate
+// signal from the backend ("no custom CA; trust the public CA
+// already on this host"). In that case we return ``(nil, nil)`` so
+// ``tls.Config.RootCAs = nil`` falls through to the system trust
+// store — which is exactly what we want when the backend is fronted
+// by a public CA (Let's Encrypt via Azure Container Apps managed
+// cert in Phase 1 Dev, for example).
+//
+// Only a file we could read but whose bytes are non-empty *and*
+// didn't contain any parseable PEM blocks is a real error — that
+// means the backend delivered garbage.
 func (s *Store) CACertPool() (*x509.CertPool, error) {
 	data, err := os.ReadFile(s.caPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading CA bundle %s: %w", s.caPath, err)
+	}
+
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, nil
 	}
 
 	pool := x509.NewCertPool()

@@ -164,6 +164,13 @@ func (a *Agent) run(ctx context.Context) error {
 		log.Warn().Err(err).Msg("agent cert unavailable; continuing without client cert (insecure_skip_verify=true, dev mode)")
 		cert = tls.Certificate{}
 	}
+	// CACertPool returns (nil, nil) when the backend shipped an empty
+	// ca_cert_pem -- a legitimate "trust the public CA already on this
+	// host" signal (e.g. Azure Dev's ACA managed cert is signed by
+	// Let's Encrypt, which is in the system trust store). nil flows
+	// straight through to tls.Config.RootCAs and Go's crypto/tls falls
+	// back to the system pool, so we don't need insecure_skip_verify
+	// to reach an HTTPS backend fronted by a public CA.
 	caPool, err := store.CACertPool()
 	if err != nil {
 		if !cfg.Transport.InsecureSkipVerify {
@@ -171,6 +178,9 @@ func (a *Agent) run(ctx context.Context) error {
 		}
 		log.Warn().Err(err).Msg("CA pool unavailable; using system trust (insecure_skip_verify=true, dev mode)")
 		caPool = nil
+	}
+	if caPool == nil {
+		log.Info().Msg("no custom CA bundle; using system trust store for server verification")
 	}
 
 	mTLSClient := transport.NewClient(transport.ClientConfig{
