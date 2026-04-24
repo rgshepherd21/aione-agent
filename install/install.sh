@@ -116,13 +116,15 @@ mv "${TMPDIR}/agent" "${INSTALL_DIR}/aione-agent"
 chmod 755 "${INSTALL_DIR}/aione-agent"
 chmod 755 "$DATA_DIR"
 
-# Write config. install_token is env-substituted at first run; the systemd
-# unit the agent writes via -service install captures env vars present at
-# install time, so we export the token only for the install invocation.
+# Write config. install_token is baked in literally because kardianos/service
+# doesn't propagate install-time env vars into the systemd unit's Environment=
+# directives, so a first-boot agent started by systemd would see an empty
+# $AIONE_INSTALL_TOKEN and refuse to register. Tokens are single-use anyway —
+# post-registration they're dead weight, not a credential.
 cat > "${CONFIG_DIR}/agent.yaml" <<EOF
 agent:
   name: "${NAME}"
-  install_token: "\$AIONE_INSTALL_TOKEN"
+  install_token: "${TOKEN}"
   data_dir: "${DATA_DIR}"
   heartbeat: 30s
 
