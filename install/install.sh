@@ -58,10 +58,18 @@ case "$(uname -m)" in
 esac
 
 # --- resolve version --------------------------------------------------------
+# GitHub's /releases/latest endpoint returns 404 for repos whose only release
+# is a prerelease (tag with a dash like v0.0.1-alpha.1). During alpha we
+# frequently ship only prereleases, so fall through to the unfiltered
+# /releases endpoint and take the newest tag when /latest misses.
 if [ -z "$VERSION" ]; then
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep '"tag_name":' | head -1 | cut -d'"' -f4)"
-    [ -n "$VERSION" ] || { echo "ERROR: could not resolve latest version" >&2; exit 1; }
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep '"tag_name":' | head -1 | cut -d'"' -f4 || true)"
+    if [ -z "$VERSION" ]; then
+        VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" \
+            | grep '"tag_name":' | head -1 | cut -d'"' -f4)"
+    fi
+    [ -n "$VERSION" ] || { echo "ERROR: could not resolve a version from GitHub API (no releases?)" >&2; exit 1; }
 fi
 
 echo ">>> Installing aione-agent ${VERSION} for ${OS}-${ARCH}"

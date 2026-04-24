@@ -1,0 +1,14 @@
+# Force LF line endings on shell scripts regardless of the committer's platform.
+# Without this, Windows-side git auto-converts *.sh to CRLF on commit, and bash
+# on the target VM fails with '$'\r': command not found' at the shebang. We hit
+# this during the 2026-04-24 install.sh e2e smoke — had to `sed -i 's/\r$//'`
+# the file on the VM before it would run.
+#
+# macOS/Linux committers aren't affected; the directive is a safety net for
+# cross-platform contributors (i.e. Ryan).
+
+*.sh          text eol=lf
+install/*.sh  text eol=lf
+
+# PowerShell scripts are CRLF-native; leave them.
+*.ps1         text eol=crlf

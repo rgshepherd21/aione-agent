@@ -48,14 +48,25 @@ $Arch = switch ($env:PROCESSOR_ARCHITECTURE) {
 }
 
 # --- resolve version -------------------------------------------------------
+# /releases/latest returns 404 for repos whose only release is a prerelease
+# (tag with a dash). Fall through to /releases (unfiltered) and take the
+# newest tag when /latest misses.
 if (-not $Version) {
     try {
         $latest = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
         $Version = $latest.tag_name
     } catch {
-        throw "Could not resolve latest version from GitHub: $_"
+        # 404 or other — try the unfiltered list next.
     }
-    if (-not $Version) { throw "GitHub returned no tag_name" }
+    if (-not $Version) {
+        try {
+            $all = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases"
+            if ($all -and $all[0]) { $Version = $all[0].tag_name }
+        } catch {
+            throw "Could not resolve version from GitHub API: $_"
+        }
+    }
+    if (-not $Version) { throw "GitHub returned no releases" }
 }
 Write-Host ">>> Installing aione-agent $Version for windows-$Arch" -ForegroundColor Cyan
 
