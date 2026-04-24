@@ -118,7 +118,7 @@ jobs:
             ## aione-agent ${{ github.ref_name }}
 
             Alpha-stage agent binaries. See
-            [docs/install.md](../blob/${{ github.ref_name }}/docs/install.md)
+            [docs/install-manual.md](../blob/${{ github.ref_name }}/docs/install-manual.md)
             for the install walkthrough.
 
             **This release is not code-signed.** Windows SmartScreen may warn
