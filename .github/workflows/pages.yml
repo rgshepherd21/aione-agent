@@ -1,0 +1,85 @@
+name: Pages
+
+# Publishes install/install.sh + install/install.ps1 as a static site
+# at install.getroja.ai. This is the URL the install-token mint endpoint
+# hands to the user in the install_commands field — hosting these two
+# files here is what makes the one-liner work without any scp / manual
+# download step.
+#
+# Triggers:
+#   - push to master touching install/** (re-deploy on script updates)
+#   - workflow_dispatch (manual redeploy from the Actions tab)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'install/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Cancel older in-flight runs so only the latest master state is published.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy install/ to GitHub Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stage install/ contents as the site root. CNAME file ensures
+      # GitHub Pages serves the custom domain install.getroja.ai.
+      - name: Prepare site directory
+        run: |
+          mkdir -p _site
+          cp install/install.sh _site/install.sh
+          cp install/install.ps1 _site/install.ps1
+          echo "install.getroja.ai" > _site/CNAME
+          # index.html gives humans hitting the root a sane landing page
+          # rather than a 404.
+          cat > _site/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <title>AI One agent installer</title>
+            <style>
+              body { font-family: system-ui, sans-serif; max-width: 720px; margin: 4em auto; padding: 0 1em; line-height: 1.5; color: #222; }
+              code, pre { font-family: ui-monospace, 'SF Mono', Menlo, monospace; background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }
+              pre { padding: 1em; overflow-x: auto; }
+              h1 { margin-top: 0; }
+              .muted { color: #666; font-size: 0.9em; }
+            </style>
+          </head>
+          <body>
+            <h1>AI One agent installer</h1>
+            <p>This host serves the install scripts used by the one-liner commands the Roja chat UI hands you when you add a host.</p>
+            <h2>Linux / macOS</h2>
+            <pre>curl -sSL https://install.getroja.ai/install.sh | sudo bash -s -- --token=&lt;your-token&gt;</pre>
+            <h2>Windows (admin PowerShell)</h2>
+            <pre>iex "&amp; { $(irm https://install.getroja.ai/install.ps1) } -Token &lt;your-token&gt;"</pre>
+            <p class="muted">Source: <a href="https://github.com/rgshepherd21/aione-agent/tree/master/install">rgshepherd21/aione-agent/install/</a> · <a href="https://github.com/rgshepherd21/aione-agent/blob/master/docs/install-manual.md">manual install doc</a></p>
+          </body>
+          </html>
+          EOF
+          ls -la _site/
+
+      - uses: actions/configure-pages@v4
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site/
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
