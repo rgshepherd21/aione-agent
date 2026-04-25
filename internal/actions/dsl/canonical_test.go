@@ -3,6 +3,7 @@ package dsl
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,7 +184,12 @@ func TestCanonicalActionBody_NoHTMLEscaping(t *testing.T) {
 			t.Errorf("expected literal %q in canonical body, got: %s", lit, bodyStr)
 		}
 	}
-	for _, esc := range []string{`<`, `>`, `&`} {
+	// Go's default json.Encoder emits these unicode-escape forms for HTML
+	// safety. SetEscapeHTML(false) suppresses them. We compose the
+	// sequences via fmt.Sprintf so the source-level escapes don't get
+	// re-interpreted by anything between here and the file on disk.
+	for _, hex := range []string{"003c", "003e", "0026"} {
+		esc := fmt.Sprintf("\\u%s", hex)
 		if strings.Contains(bodyStr, esc) {
 			t.Errorf("found HTML escape sequence %q (Go default) — SetEscapeHTML(false) failed: %s", esc, bodyStr)
 		}
