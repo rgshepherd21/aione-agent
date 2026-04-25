@@ -1,0 +1,53 @@
+# KAL action: flush_dns_cache
+# Reference action — the DSL platform's acceptance test. When the DSL
+# executor + canonical body generator ship, this YAML will replace the
+# hand-coded flushDNSCache function in
+# aione-agent/internal/actions/executor/executor.go, and the existing
+# cross-platform golden-vector tests must continue to pass byte-identical.
+
+id: flush_dns_cache
+version: 1
+tier: 1
+category: network/dns
+description: "Flush the local DNS resolver cache. Idempotent; safe to run on demand."
+implementation: dsl
+patent_claim_refs: ["4e"]
+
+parameters:
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+executors:
+  linux:
+    binary: /usr/bin/resolvectl
+    args: [flush-caches]
+    fallbacks:
+      - { binary: /usr/bin/systemd-resolve, args: [--flush-caches] }
+  darwin:
+    binary: /usr/sbin/dscacheutil
+    args: [-flushcache]
+  windows:
+    binary: 'C:\Windows\System32\ipconfig.exe'
+    args: [/flushdns]
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 10
+
+state_capture:
+  pre: none
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "DNS cache re-populates on next query. No explicit rollback needed."
