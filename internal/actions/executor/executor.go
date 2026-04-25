@@ -84,6 +84,17 @@ type Executor struct {
 	// snapshot — letting the agent see action-library updates without
 	// a binary rebuild. Wired up in service.go alongside exec.New.
 	dslClient *dsl.RegistryClient
+
+	// credFetcher (optional) is the credential fetcher used by SSH /
+	// NETCONF / SNMP / cloud_api transport actions to obtain short-
+	// lived per-action credentials from the platform. Sprint D / Task
+	// #2.5. When nil, transport=ssh actions return a load-time error
+	// before reaching the SSH driver. Wired up in service.go via
+	// SetCredentialFetcher with an adapter that wraps
+	// internal/credentials.Manager into the dsl.CredentialFetcher
+	// interface (kept narrow on the dsl side so the dsl package
+	// doesn't import credentials).
+	credFetcher dsl.CredentialFetcher
 }
 
 // SetDSLClient attaches a registry client to the executor. The client's
@@ -92,6 +103,15 @@ type Executor struct {
 // to call any time before the first action dispatch.
 func (e *Executor) SetDSLClient(c *dsl.RegistryClient) {
 	e.dslClient = c
+}
+
+// SetCredentialFetcher attaches the per-action credential fetcher used
+// by non-shell transport actions (SSH / NETCONF / SNMP / cloud_api).
+// Sprint D / Task #2.5. Nil disables device-action dispatch — the
+// executor will return an error if a transport=ssh action is dispatched
+// without a fetcher, surfacing the misconfiguration loudly.
+func (e *Executor) SetCredentialFetcher(f dsl.CredentialFetcher) {
+	e.credFetcher = f
 }
 
 // New creates an Executor.  sink is called (synchronously within the action
@@ -232,13 +252,40 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 		var out string
 		var err error
 		if e.dslHasAction("flush_dns_cache") {
-			out, err = e.runDSLAction(ctx, "flush_dns_cache", action.Params)
+			reg, regErr := e.dslRegistry()
+			if regErr != nil {
+				out, err = e.flushDNSCache(ctx, action.Params)
+			} else {
+				kalAction := reg["flush_dns_cache"]
+				// flush_dns_cache is a shell-transport action — empty
+				// DeviceTarget tells runDSLAction to skip the SSH path.
+				out, err = e.runDSLAction(ctx, kalAction, action.Params, dsl.DeviceTarget{})
+			}
 		} else {
 			out, err = e.flushDNSCache(ctx, action.Params)
 		}
 		e.captureDNSState(ctx, action.CommandID, capture.CaptureTypePost)
 		return out, err
 	default:
+		// Sprint D / Task #2.5: any action.Type the hand-coded switch
+		// doesn't recognize falls through to DSL dispatch. The DSL
+		// registry's lookup-by-id determines whether the action is
+		// real; transport-aware routing inside runDSLAction picks
+		// shell vs SSH.
+		if e.dslHasAction(action.Type) {
+			reg, regErr := e.dslRegistry()
+			if regErr != nil {
+				return "", fmt.Errorf("dsl: registry: %w", regErr)
+			}
+			kalAction := reg[action.Type]
+			target := dsl.DeviceTarget{
+				ActionExecutionID: action.CommandID,
+				Vendor:            action.DeviceVendor,
+				Host:              action.DeviceHost,
+				Port:              action.DevicePort,
+			}
+			return e.runDSLAction(ctx, kalAction, action.Params, target)
+		}
 		return "", fmt.Errorf("unknown action type: %s", action.Type)
 	}
 }
