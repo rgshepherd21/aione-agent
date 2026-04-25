@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -146,12 +147,21 @@ func runOnPlatform(ctx context.Context, action *KALAction, params map[string]int
 		out.TimedOut = timedOut
 
 		if runErr != nil && !timedOut {
-			// Failure that isn't a clean exit — record + try next fallback.
-			// (Common case: ENOENT when the binary isn't installed on
-			// this host. Validator never gets to run; fallback wins.)
+			if isBinaryMissing(runErr) {
+				// Spec: fallbacks trigger ONLY on ErrBinaryMissing
+				// (kal-dsl-spec.md §fallbacks). Try the next executor.
+				out.AttemptErrs = append(out.AttemptErrs,
+					fmt.Sprintf("%s binary missing: %s", label, runErr))
+				continue
+			}
+			// Real spawn/run failure (permissions, etc.) — surface as
+			// failure of THIS executor; do NOT try fallback because
+			// that would mask the diagnostic.
 			out.AttemptErrs = append(out.AttemptErrs,
-				fmt.Sprintf("%s spawn/run: %s", label, runErr))
-			continue
+				fmt.Sprintf("%s run failed: %s", label, runErr))
+			out.EndedAt = time.Now().UTC()
+			out.Err = fmt.Sprintf("%s: %s", label, runErr)
+			return out, nil
 		}
 
 		// Validator: post_execution.exit_code must match.
@@ -161,9 +171,15 @@ func runOnPlatform(ctx context.Context, action *KALAction, params map[string]int
 			return out, nil
 		}
 
+		// Nonzero exit (or other validator-fail) is a REAL failure of
+		// the primary binary; fallback would mask it. Spec line 129:
+		// "A non-zero exit from the primary binary does NOT trigger
+		// fallback — that's a real failure, not a missing binary."
 		out.AttemptErrs = append(out.AttemptErrs,
 			fmt.Sprintf("%s exit_code=%d (want %d)", label, exitCode, expectExitCode))
-		// Fall through to the next executor.
+		out.EndedAt = time.Now().UTC()
+		out.Err = fmt.Sprintf("%s: validator failed", label)
+		return out, nil
 	}
 
 	out.EndedAt = time.Now().UTC()
@@ -387,6 +403,25 @@ func readPostExecExitCode(raw map[string]interface{}) int {
 		return 0
 	}
 	return asInt(pe["exit_code"])
+}
+
+// isBinaryMissing reports whether err indicates the executable file
+// itself could not be found (as opposed to "found, ran, exited
+// nonzero"). Mirrors the helper in
+// aione-agent/internal/actions/executor/flush_dns_cache.go (which the
+// A4 migration deletes once this is the canonical location).
+func isBinaryMissing(err error) bool {
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) && errors.Is(execErr.Err, fs.ErrNotExist) {
+		return true
+	}
+	return false
 }
 
 func sortedKeys(m map[string]interface{}) []string {
