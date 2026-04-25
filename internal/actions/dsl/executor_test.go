@@ -263,6 +263,78 @@ func TestRun_UnsupportedPlatformErrors(t *testing.T) {
 	}
 }
 
+// TestRun_NonzeroExitDoesNotTriggerFallback pins the kal-dsl-spec.md
+// §fallbacks contract: "fallbacks trigger ONLY on ErrBinaryMissing.
+// A non-zero exit from the primary binary does NOT trigger fallback —
+// that's a real failure, not a missing binary." Without this test, a
+// future refactor could quietly mask real flush failures by re-running
+// against a different binary.
+func TestRun_NonzeroExitDoesNotTriggerFallback(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses /bin/false — Linux/macOS only")
+	}
+
+	// /bin/false exists, runs, exits 1. The fallback (/bin/true) would
+	// succeed if it fired — so if Outcome.Success is true here, the
+	// fallback masked the real failure (regression).
+	yaml := `
+id: {{ID}}
+version: 1
+tier: 1
+category: network/dns
+description: "Pins fallback policy: nonzero exit MUST NOT fall through."
+implementation: dsl
+parameters:
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false
+idempotent: true
+supported_platforms:
+  - { os: linux,  archs: [amd64, arm64] }
+  - { os: darwin, archs: [amd64, arm64] }
+executors:
+  linux:
+    binary: /bin/false
+    args: []
+    fallbacks:
+      - { binary: /bin/true, args: [] }
+  darwin:
+    binary: /bin/false
+    args: []
+    fallbacks:
+      - { binary: /bin/true, args: [] }
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 5
+state_capture:
+  pre: none
+  post: stateless
+rollback:
+  possible: false
+  rationale: "Test fixture; no real state to roll back here."
+`
+	action := makeAction(t, "no_fallback_on_nonzero", yaml)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	out, err := Run(ctx, action, nil)
+	if err != nil {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+	if out.Success {
+		t.Error("expected failure (primary exited 1) — Outcome.Success=true means fallback masked the real failure")
+	}
+	if out.ExecutorUsed != "primary" {
+		t.Errorf("expected primary to be the last executor (no fallback), got %q", out.ExecutorUsed)
+	}
+	if out.ExitCode != 1 {
+		t.Errorf("expected exit code 1 (from /bin/false), got %d", out.ExitCode)
+	}
+}
+
 func TestRun_TimeoutKillsProcess(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses /bin/sleep — Linux/macOS only")

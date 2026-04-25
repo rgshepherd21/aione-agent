@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/shepherdtech/aione-agent/internal/actions/dsl"
 	"github.com/shepherdtech/aione-agent/internal/actions/validation"
 	"github.com/shepherdtech/aione-agent/internal/capture"
 	"github.com/shepherdtech/aione-agent/internal/config"
@@ -69,6 +70,14 @@ type Executor struct {
 	agentID       string
 	tenantID      string
 	capturePoster CapturePoster
+
+	// DSL registry — lazy-loaded on first use. See dsl_dispatch.go for
+	// the loader + the runDSLAction wiring. The hand-coded action
+	// implementations in this package are the fallback when the DSL
+	// registry doesn't have an entry for the requested action.
+	dslOnce sync.Once
+	dslReg  dsl.Registry
+	dslErr  error
 }
 
 // New creates an Executor.  sink is called (synchronously within the action
@@ -189,18 +198,30 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 	case "apply_config":
 		return e.applyConfig(ctx, action.Params)
 	case "flush_dns_cache":
-		// KAL action seeded by aione-backend migration 021. Executor
-		// lives in flush_dns_cache.go in this package. Bracketed with
-		// pre/post state captures via captureDNSState (see captures.go)
-		// so the rollback pipeline has a before/after snapshot. Capture
-		// failures are logged and swallowed -- the action's own success
-		// is not coupled to capture-pipeline health.
+		// KAL action seeded by aione-backend migration 021. Bracketed
+		// with pre/post state captures via captureDNSState (see
+		// captures.go) so the rollback pipeline has a before/after
+		// snapshot. Capture failures are logged and swallowed — the
+		// action's own success is not coupled to capture-pipeline health.
+		//
+		// Routing: if the DSL registry has flush_dns_cache (the embedded
+		// YAML at internal/actions/dsl/kal/actions/network/dns/), use
+		// the generic DSL executor. Falls back to the hand-coded
+		// implementation in flush_dns_cache.go ONLY if the DSL registry
+		// failed to load (defensive — agent shouldn't bootkill on a
+		// corrupt registry; see dslRegistry() in dsl_dispatch.go).
 		// Pass action.CommandID (the per-dispatch correlation id that
-		// equals action_executions.id on the backend) -- NOT action.ID
+		// equals action_executions.id on the backend) — NOT action.ID
 		// (the KAL action slug). The state-captures endpoint validates
 		// action_execution_id as a UUID; sending a slug 422s the POST.
 		e.captureDNSState(ctx, action.CommandID, capture.CaptureTypePre)
-		out, err := e.flushDNSCache(ctx, action.Params)
+		var out string
+		var err error
+		if e.dslHasAction("flush_dns_cache") {
+			out, err = e.runDSLAction(ctx, "flush_dns_cache", action.Params)
+		} else {
+			out, err = e.flushDNSCache(ctx, action.Params)
+		}
 		e.captureDNSState(ctx, action.CommandID, capture.CaptureTypePost)
 		return out, err
 	default:
