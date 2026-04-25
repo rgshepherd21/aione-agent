@@ -1,0 +1,344 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://getroja.ai/schemas/kal/action.schema.v1.json",
+  "title": "KAL Action Definition",
+  "description": "Declarative specification for a single Known Action Library (KAL) action. See /AI One/kal-dsl-spec.md for the narrative spec. Enforced by app/services/kal_registry.py at backend startup; any YAML file under kal/actions/**/*.yaml that fails validation causes the backend to refuse to start (loud + early).",
+  "type": "object",
+
+  "required": [
+    "id",
+    "version",
+    "tier",
+    "category",
+    "description",
+    "implementation",
+    "parameters",
+    "idempotent",
+    "supported_platforms",
+    "validators",
+    "state_capture",
+    "rollback"
+  ],
+
+  "additionalProperties": false,
+
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique action id, snake_case, matches the YAML filename stem.",
+      "pattern": "^[a-z][a-z0-9_]*[a-z0-9]$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "version": {
+      "type": "integer",
+      "description": "Monotonically-increasing version. Bump on any schema-affecting change. Old versions kept for N months so mid-rollout agents on older binaries still match.",
+      "minimum": 1
+    },
+    "tier": {
+      "type": "integer",
+      "description": "Risk tier per KAL v1 spec. 1=autonomous idempotent, 2=approval-required, 3=escalation-only, 4=human-only, 5=monitoring/read-only.",
+      "enum": [1, 2, 3, 4, 5]
+    },
+    "category": {
+      "type": "string",
+      "description": "Slash-separated hierarchy for UI grouping + action discovery. Match the filesystem path under kal/actions/.",
+      "pattern": "^[a-z][a-z0-9_]*(/[a-z][a-z0-9_]*)*$",
+      "minLength": 3,
+      "maxLength": 128
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable description shown in admin UI and used by the AI orchestrator for action selection. Keep ≤ 500 chars; elaborate in kal-dsl-spec.md if needed.",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "implementation": {
+      "type": "string",
+      "description": "\"dsl\" = this YAML is the complete implementation. \"curated\" = stub that points at a hand-coded Go function (Tier 3/4).",
+      "enum": ["dsl", "curated"]
+    },
+    "patent_claim_refs": {
+      "type": "array",
+      "description": "Patent claim identifiers this action provides RTP evidence for. Example: [\"4e\", \"1-vii\"].",
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9]+(-[ivxlcdmIVXLCDM]+|[a-z])?$"
+      },
+      "uniqueItems": true
+    },
+    "deprecated": {
+      "type": "boolean",
+      "description": "When true, dispatchers refuse new invocations of this action. Existing in-flight executions complete normally.",
+      "default": false
+    },
+    "replaced_by": {
+      "type": "string",
+      "description": "Points at the successor action id. Only meaningful when deprecated=true.",
+      "pattern": "^[a-z][a-z0-9_]*[a-z0-9]$"
+    },
+
+    "parameters": {
+      "type": "object",
+      "description": "Action parameters + validation. Parameters flow from the AI orchestrator to the executor.",
+      "required": ["schema"],
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "object",
+          "description": "JSON Schema draft-07 for the parameter object. `additionalProperties: false` is REQUIRED on parameterful actions (enforced by loader rule #6a).",
+          "required": ["type"],
+          "properties": {
+            "type": { "const": "object" },
+            "properties": { "type": "object" },
+            "required": { "type": "array", "items": { "type": "string" } },
+            "additionalProperties": { "type": "boolean" }
+          }
+        }
+      }
+    },
+
+    "idempotent": {
+      "type": "boolean",
+      "description": "Declared, not assumed. Tier-1 actions MUST be idempotent (enforced by loader rule #3). Tier-2+ may declare false but then MUST declare rollback.possible=true."
+    },
+
+    "supported_platforms": {
+      "type": "array",
+      "description": "Platform matrix — which OS+arch combinations this action supports. Agent OS/arch is verified at dispatch; mismatched dispatch returns ErrUnsupportedOS.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["os", "archs"],
+        "additionalProperties": false,
+        "properties": {
+          "os": {
+            "type": "string",
+            "enum": ["linux", "darwin", "windows"]
+          },
+          "archs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "enum": ["amd64", "arm64"]
+            }
+          }
+        }
+      }
+    },
+
+    "executors": {
+      "type": "object",
+      "description": "Per-OS executor specs. REQUIRED when implementation='dsl'; FORBIDDEN when implementation='curated'. Keys must match os values in supported_platforms (enforced by loader rule #7).",
+      "additionalProperties": false,
+      "properties": {
+        "linux":   { "$ref": "#/$defs/executor_spec" },
+        "darwin":  { "$ref": "#/$defs/executor_spec" },
+        "windows": { "$ref": "#/$defs/executor_spec" }
+      }
+    },
+
+    "curated_ref": {
+      "type": "object",
+      "description": "Reference to a hand-coded Go function. REQUIRED when implementation='curated'; FORBIDDEN when implementation='dsl'. Must resolve against the Go-side init()-registered function table (enforced by loader rule #8).",
+      "required": ["go_package", "go_function"],
+      "additionalProperties": false,
+      "properties": {
+        "go_package": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_./-]+$",
+          "description": "Go import path, e.g. 'aione-agent/internal/actions/curated/firewall'."
+        },
+        "go_function": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Za-z0-9_]*$",
+          "description": "Exported Go function name."
+        }
+      }
+    },
+
+    "parameter_transforms": {
+      "type": "object",
+      "description": "Derived parameters computed from declared parameters. Enables e.g. Windows timeout-in-milliseconds from user's timeout-in-seconds param without the parameter schema leaking that complexity.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["from", "op"],
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "Source parameter name (must exist in parameters.schema.properties)."
+          },
+          "op": {
+            "type": "string",
+            "enum": ["multiply", "divide", "add", "subtract", "format_hex", "format_cidr"]
+          },
+          "by": {
+            "type": "number",
+            "description": "Numeric operand for multiply/divide/add/subtract. REQUIRED for those ops."
+          }
+        }
+      }
+    },
+
+    "validators": {
+      "type": "object",
+      "required": ["post_execution"],
+      "additionalProperties": false,
+      "properties": {
+        "post_execution": {
+          "type": "object",
+          "required": ["timeout_seconds"],
+          "additionalProperties": false,
+          "properties": {
+            "exit_code": {
+              "description": "Expected exit code. Default 0.",
+              "oneOf": [
+                { "type": "integer", "minimum": 0, "maximum": 255 },
+                { "type": "null" }
+              ],
+              "default": 0
+            },
+            "timeout_seconds": {
+              "type": "integer",
+              "description": "Hard timeout enforced by context.WithTimeout. Exceeding returns ErrTimeout; dispatcher reports status=timed_out.",
+              "minimum": 1,
+              "maximum": 600
+            },
+            "stdout_regex": {
+              "description": "Optional regex that must match stdout for success. Null disables.",
+              "oneOf": [
+                { "type": "string", "format": "regex" },
+                { "type": "null" }
+              ]
+            },
+            "stderr_regex_not": {
+              "description": "Optional regex that MUST NOT match stderr. If it matches, action is failed. Null disables.",
+              "oneOf": [
+                { "type": "string", "format": "regex" },
+                { "type": "null" }
+              ]
+            }
+          }
+        }
+      }
+    },
+
+    "state_capture": {
+      "type": "object",
+      "description": "Declarative state-capture wrapper. \"none\" = skip. \"stateless\" = no capture needed (action has no observable state). Otherwise, references a snapshot procedure id registered in state_capture_service.py.",
+      "required": ["pre", "post"],
+      "additionalProperties": false,
+      "properties": {
+        "pre": {
+          "type": "string",
+          "pattern": "^(none|stateless|snapshot_[a-z][a-z0-9_]*)$"
+        },
+        "post": {
+          "type": "string",
+          "pattern": "^(none|stateless|snapshot_[a-z][a-z0-9_]*)$"
+        }
+      }
+    },
+
+    "rollback": {
+      "type": "object",
+      "description": "Rollback specification. If possible=false, rationale is required. If possible=true, spec is required (enforced by loader rule #9).",
+      "required": ["possible"],
+      "additionalProperties": false,
+      "properties": {
+        "possible": { "type": "boolean" },
+        "rationale": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 500,
+          "description": "REQUIRED when possible=false. Explains why rollback is unnecessary or impossible."
+        },
+        "spec": {
+          "type": "object",
+          "description": "REQUIRED when possible=true. Same shape as a top-level executors/curated_ref block; describes how to undo the action.",
+          "additionalProperties": false,
+          "properties": {
+            "executors":   { "$ref": "#/properties/executors" },
+            "curated_ref": { "$ref": "#/properties/curated_ref" }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": { "possible": { "const": false } },
+          "required": ["rationale"]
+        },
+        {
+          "properties": { "possible": { "const": true } },
+          "required": ["spec"]
+        }
+      ]
+    }
+  },
+
+  "allOf": [
+    {
+      "description": "implementation=dsl requires executors, forbids curated_ref.",
+      "if":   { "properties": { "implementation": { "const": "dsl" } } },
+      "then": {
+        "required": ["executors"],
+        "not": { "required": ["curated_ref"] }
+      }
+    },
+    {
+      "description": "implementation=curated requires curated_ref, forbids executors.",
+      "if":   { "properties": { "implementation": { "const": "curated" } } },
+      "then": {
+        "required": ["curated_ref"],
+        "not": { "required": ["executors"] }
+      }
+    },
+    {
+      "description": "Tier-1 actions must declare idempotent=true. Tier-2+ may declare false, but only if rollback.possible=true. Loader rule #3 enforces the tier-1 clause; additional cross-field checks (tier-2+ non-idempotent must have rollback) live in the Python loader since JSON Schema can't express multi-field conditionals cleanly.",
+      "if":   { "properties": { "tier": { "const": 1 } } },
+      "then": { "properties": { "idempotent": { "const": true } } }
+    }
+  ],
+
+  "$defs": {
+    "executor_spec": {
+      "type": "object",
+      "description": "Per-OS executor invocation. `binary` must be absolute + non-shell; interpolation in args is scoped to declared parameters + parameter_transforms.",
+      "required": ["binary", "args"],
+      "additionalProperties": false,
+      "properties": {
+        "binary": {
+          "type": "string",
+          "description": "Absolute path to the binary. Unix: starts with '/'. Windows: starts with drive letter (e.g. 'C:\\Windows\\System32\\...'). Must NOT be a shell (loader rule #5 blocklists sh/bash/cmd/powershell/wsl). Must NOT contain path-traversal ('..').",
+          "minLength": 2,
+          "pattern": "^(/|[A-Za-z]:[\\\\/])[^\\x00]+$"
+        },
+        "args": {
+          "type": "array",
+          "description": "Literal strings + {{parameter}} interpolation. Each array element is a separate arg (no shell-concatenation). Never a single string that gets split.",
+          "items": {
+            "type": "string",
+            "minLength": 0,
+            "maxLength": 1024
+          }
+        },
+        "fallbacks": {
+          "type": "array",
+          "description": "Ordered list of alternative binary+args to try ONLY when the primary fails with ErrBinaryMissing. Nonzero exits from the primary do NOT trigger fallback.",
+          "items": {
+            "type": "object",
+            "required": ["binary", "args"],
+            "additionalProperties": false,
+            "properties": {
+              "binary": { "$ref": "#/$defs/executor_spec/properties/binary" },
+              "args":   { "$ref": "#/$defs/executor_spec/properties/args" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
