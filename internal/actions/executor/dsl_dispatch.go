@@ -9,14 +9,28 @@ import (
 	"github.com/shepherdtech/aione-agent/internal/actions/dsl"
 )
 
-// dslRegistry returns the embedded KAL action registry, lazy-loading it
-// on first call. The agent ships with a build-time-bundled snapshot of
-// kal/actions/**.yaml; B2 (task #28) replaces this with a signed pull
-// from the backend at startup. The dsl package's own tests gate that
-// the embedded registry is well-formed at build time, so a load failure
-// here is a hard infrastructure bug — log loudly and let the dispatch
-// fall back to the hand-coded implementations.
+// dslRegistry returns the active KAL action registry. Preference order:
+//
+//  1. Live BE-pull (e.dslClient.Current()) — set up in service.go and
+//     refreshed every 5 min. Lets the agent pick up action-library updates
+//     without a binary rebuild (task #28).
+//  2. Embedded build-time snapshot — lazy-loaded once. Bootstrap fallback
+//     for first-run agents and offline mode.
+//
+// The dsl package's own tests gate that the embedded registry is well-formed
+// at build time, so a load failure here is a hard infrastructure bug — log
+// loudly and let the dispatch fall back to the hand-coded implementations.
 func (e *Executor) dslRegistry() (dsl.Registry, error) {
+	// Preference 1: live BE-pull registry, if a client is wired and has
+	// successfully fetched at least once.
+	if e.dslClient != nil {
+		if reg := e.dslClient.Current(); reg != nil {
+			return reg, nil
+		}
+	}
+
+	// Preference 2: embedded snapshot. Lazy-loaded on first request,
+	// then cached for the process lifetime.
 	e.dslOnce.Do(func() {
 		e.dslReg, e.dslErr = dsl.LoadEmbeddedRegistry()
 		if e.dslErr != nil {

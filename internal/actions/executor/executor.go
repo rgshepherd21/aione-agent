@@ -78,6 +78,20 @@ type Executor struct {
 	dslOnce sync.Once
 	dslReg  dsl.Registry
 	dslErr  error
+
+	// dslClient (optional) is the live BE-pull registry client. When
+	// set + populated, dslRegistry() prefers it over the embedded
+	// snapshot — letting the agent see action-library updates without
+	// a binary rebuild. Wired up in service.go alongside exec.New.
+	dslClient *dsl.RegistryClient
+}
+
+// SetDSLClient attaches a registry client to the executor. The client's
+// Current() registry takes precedence over the embedded one; falls back
+// to embedded if the client hasn't pulled yet OR the pull failed. Safe
+// to call any time before the first action dispatch.
+func (e *Executor) SetDSLClient(c *dsl.RegistryClient) {
+	e.dslClient = c
 }
 
 // New creates an Executor.  sink is called (synchronously within the action

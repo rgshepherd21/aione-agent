@@ -13,6 +13,7 @@ import (
 
 	"github.com/kardianos/service"
 	"github.com/rs/zerolog/log"
+	"github.com/shepherdtech/aione-agent/internal/actions/dsl"
 	"github.com/shepherdtech/aione-agent/internal/actions/executor"
 	"github.com/shepherdtech/aione-agent/internal/actions/validation"
 	"github.com/shepherdtech/aione-agent/internal/buffer"
@@ -226,6 +227,39 @@ func (a *Agent) run(ctx context.Context) error {
 	exec := executor.New(cfg.Actions, nil)
 	disp := dispatcher.New(ctx, exec, mTLSClient, agentID)
 	exec.SetResultSink(disp.PostResult)
+
+	// --- KAL DSL registry pull (task #28, B2) -----------------------------
+	// Pulls the BE-signed action library on startup + refreshes every 5
+	// min. Reuses the existing HMACSecret (same key the BE signs commands
+	// with — see app/services/kal_signer.py). On verify success the
+	// fetched registry takes precedence over the build-time embed; on
+	// any failure we fall back to embedded so the agent still dispatches.
+	//
+	// Cache file lives next to the agent's data dir so it survives
+	// restarts but is treated as untrusted on read (signature re-verified).
+	if cfg.Actions.HMACSecret != "" && cfg.API.BaseURL != "" {
+		regClient := &dsl.RegistryClient{
+			BaseURL:   cfg.API.BaseURL,
+			Secret:    cfg.Actions.HMACSecret,
+			CachePath: filepath.Join(cfg.Agent.DataDir, "kal-registry.json"),
+		}
+		// Warm-load from cache before the first network call so a
+		// temporarily-offline boot still has a registry to dispatch.
+		if err := regClient.LoadCache(); err != nil {
+			log.Debug().Err(err).Msg("dsl: cache cold-start (no prior cache or unreadable)")
+		}
+		if err := regClient.Fetch(ctx); err != nil {
+			log.Warn().Err(err).Msg("dsl: initial registry fetch failed — using embedded snapshot until next refresh succeeds")
+		} else if reg := regClient.Current(); reg != nil {
+			log.Info().Int("actions", len(reg)).Msg("dsl: live registry loaded from backend")
+		}
+		regClient.StartRefreshLoop(ctx, func(err error) {
+			log.Warn().Err(err).Msg("dsl: background registry refresh failed")
+		})
+		exec.SetDSLClient(regClient)
+	} else {
+		log.Debug().Msg("dsl: HMAC secret or API base URL missing — skipping live registry pull, embedded snapshot only")
+	}
 
 	// --- State-capture poster --------------------------------------------
 	// Wire the capture-bracket path into the executor. With this wired,
