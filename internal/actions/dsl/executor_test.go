@@ -301,7 +301,7 @@ state_capture:
   post: stateless
 rollback:
   possible: false
-  rationale: "No state."
+  rationale: "Sleep has no persistent state to roll back."
 `
 	action := makeAction(t, "timeout_test", yaml)
 

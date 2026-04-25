@@ -337,6 +337,11 @@ func validateParams(action *KALAction, params map[string]interface{}) error {
 	}
 
 	// JSON-roundtrip params so number types align with what the schema expects.
+	// nil params → empty object (a parameterless action's params is conceptually {},
+	// not null — null fails type:object validation).
+	if params == nil {
+		params = map[string]interface{}{}
+	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		return fmt.Errorf("marshal call params: %w", err)
