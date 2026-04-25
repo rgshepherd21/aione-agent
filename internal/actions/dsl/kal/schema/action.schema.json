@@ -20,6 +20,8 @@
     "rollback"
   ],
 
+  "$comment": "Sprint D / Task #3 added the `transport`, `cred_type`, and `device_executors` fields to support network-device actions (SSH/NETCONF/SNMP). When `transport` is absent or 'shell', actions retain the original OS-keyed `executors` shape; when `transport` is anything else, the action MUST declare `cred_type` + a vendor-keyed `device_executors` block instead.",
+
   "additionalProperties": false,
 
   "properties": {
@@ -57,6 +59,17 @@
       "type": "string",
       "description": "\"dsl\" = this YAML is the complete implementation. \"curated\" = stub that points at a hand-coded Go function (Tier 3/4).",
       "enum": ["dsl", "curated"]
+    },
+    "transport": {
+      "type": "string",
+      "description": "Selects the executor dispatch path. 'shell' (default) = local fork+exec on the agent host (uses `executors`, OS-keyed). 'ssh' = SSH session against a network device (uses `device_executors`, vendor-keyed). 'netconf' / 'snmp' / 'cloud_api' reserved for future transports.",
+      "enum": ["shell", "ssh", "netconf", "snmp", "cloud_api"],
+      "default": "shell"
+    },
+    "cred_type": {
+      "type": "string",
+      "description": "REQUIRED when transport != 'shell'. Names the credential kind the agent fetches per action via POST /v1/credentials/issue. Maps directly to the cred_type enum in app/schemas/credentials.py.",
+      "enum": ["ssh_key", "ssh_password", "api_token", "snmp_v2c", "snmp_v3"]
     },
     "patent_claim_refs": {
       "type": "array",
@@ -131,13 +144,32 @@
 
     "executors": {
       "type": "object",
-      "description": "Per-OS executor specs. REQUIRED when implementation='dsl'; FORBIDDEN when implementation='curated'. Keys must match os values in supported_platforms (enforced by loader rule #7).",
+      "description": "Per-OS executor specs (transport='shell'). REQUIRED when implementation='dsl' AND transport='shell' (or absent). FORBIDDEN when implementation='curated' OR transport != 'shell'. Keys must match os values in supported_platforms (loader rule #7).",
       "additionalProperties": false,
       "properties": {
         "linux":   { "$ref": "#/$defs/executor_spec" },
         "darwin":  { "$ref": "#/$defs/executor_spec" },
         "windows": { "$ref": "#/$defs/executor_spec" }
       }
+    },
+
+    "device_executors": {
+      "type": "object",
+      "description": "Per-vendor executor specs for non-shell transports (ssh/netconf/snmp/cloud_api). REQUIRED when implementation='dsl' AND transport != 'shell'. Keys are normalized vendor slugs; values describe the vendor-specific command set or RPC payload.",
+      "additionalProperties": false,
+      "properties": {
+        "cisco_iosxe":      { "$ref": "#/$defs/device_executor_spec" },
+        "cisco_nxos":       { "$ref": "#/$defs/device_executor_spec" },
+        "cisco_iosxr":      { "$ref": "#/$defs/device_executor_spec" },
+        "arista_eos":       { "$ref": "#/$defs/device_executor_spec" },
+        "juniper_junos":    { "$ref": "#/$defs/device_executor_spec" },
+        "palo_alto_panos":  { "$ref": "#/$defs/device_executor_spec" },
+        "fortinet_fortios": { "$ref": "#/$defs/device_executor_spec" },
+        "aruba_aoscx":      { "$ref": "#/$defs/device_executor_spec" },
+        "mikrotik_routeros":{ "$ref": "#/$defs/device_executor_spec" },
+        "generic":          { "$ref": "#/$defs/device_executor_spec" }
+      },
+      "minProperties": 1
     },
 
     "curated_ref": {
@@ -281,19 +313,54 @@
 
   "allOf": [
     {
-      "description": "implementation=dsl requires executors, forbids curated_ref.",
-      "if":   { "properties": { "implementation": { "const": "dsl" } } },
+      "description": "implementation=dsl + transport=shell (or absent) requires executors, forbids curated_ref + device_executors.",
+      "if": {
+        "properties": { "implementation": { "const": "dsl" } },
+        "anyOf": [
+          { "not": { "required": ["transport"] } },
+          { "properties": { "transport": { "const": "shell" } }, "required": ["transport"] }
+        ]
+      },
       "then": {
         "required": ["executors"],
-        "not": { "required": ["curated_ref"] }
+        "not": {
+          "anyOf": [
+            { "required": ["curated_ref"] },
+            { "required": ["device_executors"] }
+          ]
+        }
       }
     },
     {
-      "description": "implementation=curated requires curated_ref, forbids executors.",
+      "description": "implementation=dsl + transport in (ssh, netconf, snmp, cloud_api) requires device_executors + cred_type, forbids executors + curated_ref.",
+      "if": {
+        "properties": {
+          "implementation": { "const": "dsl" },
+          "transport": { "enum": ["ssh", "netconf", "snmp", "cloud_api"] }
+        },
+        "required": ["transport"]
+      },
+      "then": {
+        "required": ["device_executors", "cred_type"],
+        "not": {
+          "anyOf": [
+            { "required": ["curated_ref"] },
+            { "required": ["executors"] }
+          ]
+        }
+      }
+    },
+    {
+      "description": "implementation=curated requires curated_ref, forbids executors + device_executors.",
       "if":   { "properties": { "implementation": { "const": "curated" } } },
       "then": {
         "required": ["curated_ref"],
-        "not": { "required": ["executors"] }
+        "not": {
+          "anyOf": [
+            { "required": ["executors"] },
+            { "required": ["device_executors"] }
+          ]
+        }
       }
     },
     {
@@ -304,6 +371,50 @@
   ],
 
   "$defs": {
+    "device_executor_spec": {
+      "type": "object",
+      "description": "Per-vendor executor for non-shell transports. Carries the vendor-specific command(s) the agent runs over the action's transport. Exactly one of `command` (single) or `commands` (list) must be set.",
+      "additionalProperties": false,
+      "required": [],
+      "properties": {
+        "pre_commands": {
+          "type": "array",
+          "description": "Vendor terminal-setup commands run on connect before the user-visible commands. Output is discarded; failures abort the connection. Examples: 'terminal length 0' (Cisco), 'set cli screen-length 0' (Junos).",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "command": {
+          "type": "string",
+          "description": "Single command to run on the device. Mutually exclusive with `commands`. Supports {{parameter}} interpolation against declared parameters + parameter_transforms (loader rule #6).",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "commands": {
+          "type": "array",
+          "description": "Ordered list of commands to run in one session. Mutually exclusive with `command`. Each element supports {{parameter}} interpolation. Output is concatenated with per-command marker lines (see sshclient.RunSequence).",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          }
+        },
+        "parser_template": {
+          "type": "string",
+          "description": "Optional NTC-Templates / TextFSM template name for parsing the device output into structured data. Reserved for D4 (config diff service); the runtime executor ignores this field today.",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "maxLength": 128
+        }
+      },
+      "oneOf": [
+        { "required": ["command"], "not": { "required": ["commands"] } },
+        { "required": ["commands"], "not": { "required": ["command"] } }
+      ]
+    },
+
     "executor_spec": {
       "type": "object",
       "description": "Per-OS executor invocation. `binary` must be absolute + non-shell; interpolation in args is scoped to declared parameters + parameter_transforms.",

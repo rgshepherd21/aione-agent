@@ -219,10 +219,11 @@ func mustHostPort(t *testing.T, hp string) (string, int) {
 // ─── Action-construction helper ──────────────────────────────────────────
 
 // buildAction constructs a *KALAction directly from a Raw map, skipping
-// schema validation. The schema extension that lets SSH actions declare
-// ``transport: ssh`` + vendor-keyed executor blocks is D3's work; D2 only
-// exercises the runtime dispatch. Tests build actions programmatically to
-// stay independent of the schema constraints.
+// schema validation. Sprint D / Task #3 formalized the schema split
+// (transport=shell uses `executors:` keyed by OS; transport=ssh/netconf/...
+// uses `device_executors:` keyed by vendor). For SSH-mode tests, the
+// `executors` arg is populated under the device_executors key; for
+// shell-mode tests it goes under `executors`.
 func buildAction(id, transport string, executors map[string]interface{}) *KALAction {
 	raw := map[string]interface{}{
 		"id":             id,
@@ -233,7 +234,6 @@ func buildAction(id, transport string, executors map[string]interface{}) *KALAct
 		"implementation": "dsl",
 		"idempotent":     true,
 		"transport":      transport,
-		"executors":      executors,
 		"validators": map[string]interface{}{
 			"post_execution": map[string]interface{}{
 				"timeout_seconds": 30,
@@ -252,6 +252,12 @@ func buildAction(id, transport string, executors map[string]interface{}) *KALAct
 				"additionalProperties": false,
 			},
 		},
+	}
+	if transport == "shell" || transport == "" {
+		raw["executors"] = executors
+	} else {
+		raw["device_executors"] = executors
+		raw["cred_type"] = "ssh_key"
 	}
 	return &KALAction{ID: id, Raw: raw}
 }

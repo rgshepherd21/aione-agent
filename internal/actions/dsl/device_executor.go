@@ -119,11 +119,14 @@ func RunDeviceAction(
 			fmt.Errorf("dsl: action %q has transport=%q, not 'ssh'", action.ID, transport)
 	}
 
-	// 3. Pick the vendor-specific executor block.
-	executors, ok := action.Raw["executors"].(map[string]interface{})
+	// 3. Pick the vendor-specific executor block. Sprint D / Task #3
+	//    formalized the schema split: shell actions use `executors:`
+	//    keyed by OS, device actions use `device_executors:` keyed by
+	//    vendor. Read the latter for SSH/NETCONF/SNMP/cloud_api transports.
+	executors, ok := action.Raw["device_executors"].(map[string]interface{})
 	if !ok {
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-			fmt.Errorf("dsl: action %q has no executors block", action.ID)
+			fmt.Errorf("dsl: action %q has no device_executors block", action.ID)
 	}
 	if target.Vendor == "" {
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
@@ -132,7 +135,7 @@ func RunDeviceAction(
 	vendorBlock, ok := executors[target.Vendor].(map[string]interface{})
 	if !ok {
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-			fmt.Errorf("dsl: action %q has no executor for vendor %q (have %v)",
+			fmt.Errorf("dsl: action %q has no device executor for vendor %q (have %v)",
 				action.ID, target.Vendor, sortedKeys(executors))
 	}
 
