@@ -1,0 +1,57 @@
+# MIRROR of aione-backend/kal/actions/network/dns/flush_dns_cache.yaml.
+# This local copy is used by canonical_test.go to assert the agent-side
+# canonical generator produces byte-identical output to the BE-side
+# Python implementation (test_kal_canonical.py pinned SHA-256:
+# 950194372938eeaec4372654ae669041182c2c4dfa5e66f383a045bfcb2111e0).
+#
+# When task #28 (registry pull from BE) ships, the agent will load this
+# YAML from the signed registry bundle instead of from testdata. Until
+# then, keep this file byte-identical to the BE-side source — drift here
+# would silently mask a real canonical-form bug.
+
+id: flush_dns_cache
+version: 1
+tier: 1
+category: network/dns
+description: "Flush the local DNS resolver cache. Idempotent; safe to run on demand."
+implementation: dsl
+patent_claim_refs: ["4e"]
+
+parameters:
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+executors:
+  linux:
+    binary: /usr/bin/resolvectl
+    args: [flush-caches]
+    fallbacks:
+      - { binary: /usr/bin/systemd-resolve, args: [--flush-caches] }
+  darwin:
+    binary: /usr/sbin/dscacheutil
+    args: [-flushcache]
+  windows:
+    binary: 'C:\Windows\System32\ipconfig.exe'
+    args: [/flushdns]
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 10
+
+state_capture:
+  pre: none
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "DNS cache re-populates on next query. No explicit rollback needed."
