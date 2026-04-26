@@ -313,6 +313,19 @@ func checkInterpolationCoverage(raw map[string]interface{}, p string) error {
 		}
 	}
 
+	checkString := func(s, where string) error {
+		for _, m := range interpolationRE.FindAllStringSubmatch(s, -1) {
+			name := m[1]
+			if _, ok := declared[name]; !ok {
+				return loadErrf(p,
+					"%s interpolation '{{%s}}' is not a declared parameter or parameter_transform",
+					where, name)
+			}
+		}
+		return nil
+	}
+
+	// Shell executors: scan args.
 	for _, executor := range iterAllExecutors(raw) {
 		args, _ := executor["args"].([]interface{})
 		for _, a := range args {
@@ -320,12 +333,36 @@ func checkInterpolationCoverage(raw map[string]interface{}, p string) error {
 			if !ok {
 				continue
 			}
-			for _, m := range interpolationRE.FindAllStringSubmatch(s, -1) {
-				name := m[1]
-				if _, ok := declared[name]; !ok {
-					return loadErrf(p,
-						"arg interpolation '{{%s}}' is not a declared parameter or parameter_transform",
-						name)
+			if err := checkString(s, "arg"); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Device executors (Sprint D / Task #3): scan pre_commands, command,
+	// commands. SSH/NETCONF/SNMP/cloud_api transports use these instead
+	// of the shell args array.
+	for _, executor := range iterAllDeviceExecutors(raw) {
+		if pre, ok := executor["pre_commands"].([]interface{}); ok {
+			for _, item := range pre {
+				if s, ok := item.(string); ok {
+					if err := checkString(s, "pre_command"); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if cmd, ok := executor["command"].(string); ok {
+			if err := checkString(cmd, "command"); err != nil {
+				return err
+			}
+		}
+		if cmds, ok := executor["commands"].([]interface{}); ok {
+			for _, item := range cmds {
+				if s, ok := item.(string); ok {
+					if err := checkString(s, "command"); err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -336,6 +373,15 @@ func checkInterpolationCoverage(raw map[string]interface{}, p string) error {
 func checkPlatformMatrixConsistent(raw map[string]interface{}, p string) error {
 	impl, _ := raw["implementation"].(string)
 	if impl != "dsl" {
+		return nil
+	}
+	// Sprint D / Task #3: supported_platforms is OS-keyed (which agent
+	// hosts can dispatch the action). For non-shell transports, every
+	// agent OS can dispatch any device action — the OS↔executor coupling
+	// only applies to shell. Vendor coverage is enforced by the schema's
+	// device_executors property allowlist.
+	transport, _ := raw["transport"].(string)
+	if transport != "" && transport != "shell" {
 		return nil
 	}
 
@@ -443,6 +489,38 @@ func iterAllExecutors(raw map[string]interface{}) []map[string]interface{} {
 			}
 		}
 	}
+	return out
+}
+
+// iterAllDeviceExecutors yields every device-transport executor block
+// (Sprint D / Task #3) — primary device_executors and any
+// rollback.spec.device_executors. Device executors don't carry `binary`
+// / `args`; instead they have `pre_commands` / `command` / `commands`
+// strings that the interpolation-coverage check needs to scan. Mirrors
+// _iter_all_device_executors in the Python loader.
+func iterAllDeviceExecutors(raw map[string]interface{}) []map[string]interface{} {
+	var out []map[string]interface{}
+
+	if execs, ok := raw["device_executors"].(map[string]interface{}); ok {
+		for _, spec := range execs {
+			if m, ok := spec.(map[string]interface{}); ok {
+				out = append(out, m)
+			}
+		}
+	}
+
+	if rb, ok := raw["rollback"].(map[string]interface{}); ok {
+		if spec, ok := rb["spec"].(map[string]interface{}); ok {
+			if execs, ok := spec["device_executors"].(map[string]interface{}); ok {
+				for _, dspec := range execs {
+					if m, ok := dspec.(map[string]interface{}); ok {
+						out = append(out, m)
+					}
+				}
+			}
+		}
+	}
+
 	return out
 }
 
