@@ -9,6 +9,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -128,6 +129,9 @@ func sshAction() *dsl.KALAction {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 func TestRunDSLAction_ShellTransportRoutesThroughRun(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses /bin/echo; routing path is OS-independent and is covered on linux/darwin")
+	}
 	e := &Executor{}
 	out, err := e.runDSLAction(
 		context.Background(),
@@ -215,6 +219,9 @@ func TestRunDSLAction_SSHWithoutFetcherFailsFast(t *testing.T) {
 }
 
 func TestRunDSLAction_AbsentTransportTreatedAsShell(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fixture uses /bin/echo; backward-compat path is OS-independent and is covered on linux/darwin")
+	}
 	// An action without a transport field at all should run via the
 	// shell path. Backward compatibility for actions authored before
 	// Sprint D's schema landed.
