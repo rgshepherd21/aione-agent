@@ -288,6 +288,27 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 		}
 	}
 
+	// Device-targeting fields (Sprint D / Task #2.5). The backend
+	// populates these on the outer AgentCommand envelope when an action
+	// targets a network device — they're how the agent's executor knows
+	// which Device row to dial over SSH. They ride OUTSIDE the signed
+	// KAL action body (the signed body is the inner ``payload``); the
+	// envelope-level fields are validation-context, not action-state.
+	// Absent / empty for shell actions.
+	deviceVendor, _ := cmd.Payload["device_vendor"].(string)
+	deviceHost, _ := cmd.Payload["device_host"].(string)
+	var devicePort int
+	switch v := cmd.Payload["device_port"].(type) {
+	case float64:
+		devicePort = int(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			devicePort = int(n)
+		}
+	case int:
+		devicePort = v
+	}
+
 	return validation.Action{
 		ID:      id,
 		Type:    typ,
@@ -298,7 +319,10 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 		// row on command-results writeback. Distinct from the KAL action
 		// slug in `id`; see the Action struct doc for why this field is
 		// off-wire / off-signature.
-		CommandID: cmd.CommandID,
+		CommandID:    cmd.CommandID,
+		DeviceVendor: deviceVendor,
+		DeviceHost:   deviceHost,
+		DevicePort:   devicePort,
 	}, nil
 }
 

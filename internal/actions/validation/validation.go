@@ -47,6 +47,16 @@ type Action struct {
 	Timeout   int               `json:"timeout_seconds"`
 	Sig       string            `json:"sig"` // hex-encoded HMAC-SHA256 over canonical JSON
 	CommandID string            `json:"-"`   // outer AgentCommand.command_id; off-wire, off-signature
+
+	// Device targeting fields (Sprint D / Task #2.5). Off-wire and off-
+	// signature for the same reason CommandID is — they ride on the outer
+	// AgentCommand envelope (BE populates them from the Device row before
+	// it queues the command), not inside the signed KAL action body.
+	// Empty strings + zero port mean "shell action, no device target";
+	// the executor's transport check is the gate that uses them.
+	DeviceVendor string `json:"-"`
+	DeviceHost   string `json:"-"`
+	DevicePort   int    `json:"-"`
 }
 
 // ErrNotAllowed is returned when the action type is not in the allowlist.

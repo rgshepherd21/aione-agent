@@ -261,6 +261,19 @@ func (a *Agent) run(ctx context.Context) error {
 		log.Debug().Msg("dsl: HMAC secret or API base URL missing — skipping live registry pull, embedded snapshot only")
 	}
 
+	// --- Per-action credential manager (Sprint D / Task #1, #2.5) ---------
+	// Constructs the agent-side cache + fetcher for short-lived per-action
+	// credentials issued by the backend's POST /v1/credentials/issue
+	// endpoint. The executor's SSH-transport dispatch path uses this
+	// fetcher to obtain SSH keys / API tokens / SNMPv3 secrets per
+	// action; the shell-transport path doesn't need it.
+	//
+	// A periodic Purge sweep evicts expired entries every 5 min so the
+	// in-memory cache doesn't grow without bound on a busy agent.
+	credManager := credentials.NewManager(mTLSClient)
+	credManager.StartPurger(ctx, 5*time.Minute)
+	exec.SetCredentialFetcher(executor.NewCredentialFetcher(credManager))
+
 	// --- State-capture poster --------------------------------------------
 	// Wire the capture-bracket path into the executor. With this wired,
 	// flush_dns_cache (and any future bracketed action) ships pre/post

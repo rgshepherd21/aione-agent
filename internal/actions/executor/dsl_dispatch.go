@@ -58,6 +58,14 @@ func (e *Executor) dslHasAction(actionID string) bool {
 // Maps the DSL Outcome to the (output, error) shape the rest of the
 // dispatch package uses.
 //
+// Sprint D / Task #2.5: transport-aware. For shell actions (transport
+// absent or "shell"), routes through dsl.Run as before. For network-
+// device actions (transport=ssh today; netconf/snmp/cloud_api are
+// reserved), routes through dsl.RunDeviceAction with a DeviceTarget
+// built from the action's off-wire fields (DeviceVendor / DeviceHost /
+// DevicePort / CommandID, all populated by the dispatcher from the
+// outer AgentCommand envelope) and the executor's CredentialFetcher.
+//
 // Param-type conversion: existing executor methods take params as
 // map[string]string (the agent-side dispatch shape — see
 // internal/dispatcher/dispatcher.go's translateAction). The DSL
@@ -68,18 +76,10 @@ func (e *Executor) dslHasAction(actionID string) bool {
 // from the backend command frame.
 func (e *Executor) runDSLAction(
 	ctx context.Context,
-	actionID string,
+	action *dsl.KALAction,
 	params map[string]string,
+	target dsl.DeviceTarget,
 ) (string, error) {
-	reg, err := e.dslRegistry()
-	if err != nil {
-		return "", fmt.Errorf("dsl: %w", err)
-	}
-	action, ok := reg[actionID]
-	if !ok {
-		return "", fmt.Errorf("dsl: action %q not found in registry", actionID)
-	}
-
 	// Coerce string-keyed params to the interface{} shape Run expects.
 	// nil → empty map (Run's validator special-cases nil too, but being
 	// explicit here makes the conversion intent obvious).
@@ -88,7 +88,32 @@ func (e *Executor) runDSLAction(
 		p[k] = v
 	}
 
-	outcome, err := dsl.Run(ctx, action, p)
+	// Branch on transport. The schema (Sprint D / Task #3) constrains
+	// transport to {shell, ssh, netconf, snmp, cloud_api}; we accept
+	// any of the non-shell values via the device-action path so that
+	// new transports can author YAML before the agent driver lands —
+	// the load-time error surfaces clearly.
+	transport, _ := action.Raw["transport"].(string)
+	var outcome dsl.Outcome
+	var err error
+
+	if transport == "" || transport == "shell" {
+		outcome, err = dsl.Run(ctx, action, p)
+	} else {
+		if e.credFetcher == nil {
+			return "", fmt.Errorf(
+				"dsl[%s]: transport=%q requires a credential fetcher; "+
+					"executor not wired with SetCredentialFetcher",
+				action.ID, transport,
+			)
+		}
+		// Stamp the ActionExecutionID from the dispatch envelope's
+		// CommandID. The backend's /v1/credentials/issue handler
+		// expects this to match an ActionExecution row in the running
+		// state — which is exactly what command_id is.
+		outcome, err = dsl.RunDeviceAction(ctx, action, p, target, e.credFetcher)
+	}
+
 	if err != nil {
 		return "", err
 	}
@@ -103,7 +128,7 @@ func (e *Executor) runDSLAction(
 		if msg == "" {
 			msg = strings.Join(outcome.AttemptErrs, "; ")
 		}
-		return combined, fmt.Errorf("dsl[%s]: %s", actionID, msg)
+		return combined, fmt.Errorf("dsl[%s]: %s", action.ID, msg)
 	}
 
 	out := strings.TrimSpace(outcome.Stdout)
@@ -112,7 +137,7 @@ func (e *Executor) runDSLAction(
 		// nothing on stdout. Synthesize a non-empty status so the
 		// execution row isn't blank in the operator UI — matches the
 		// existing flushDNSCache hand-coded behavior.
-		out = fmt.Sprintf("%s succeeded", actionID)
+		out = fmt.Sprintf("%s succeeded", action.ID)
 	}
 	return out, nil
 }
