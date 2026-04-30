@@ -35,3 +35,15 @@ vendor/
 
 # Windows binaries
 *.exe
+
+# Compiled binaries (release artifacts live on GitHub Releases, not in repo)
+aione-agent-*
+
+# Scratch / dev tooling
+pr-body*
+
+# Compiled binaries (release artifacts live on GitHub Releases, not source tree)
+aione-agent-*
+
+# Scratch / dev tooling
+pr-body*
