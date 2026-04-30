@@ -37,8 +37,9 @@ const flushInterval = 15 * time.Second
 
 // Agent is the top-level service object implementing kardianos/service.Program.
 type Agent struct {
-	cfg     *config.Config
-	version string
+	cfg        *config.Config
+	configPath string // Source path for in-place rewrites (Sprint H / #H3)
+	version    string
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -46,11 +47,17 @@ type Agent struct {
 }
 
 // New constructs an Agent.
-func New(cfg *config.Config, version string) (*Agent, error) {
+//
+// configPath is the YAML file path used to load cfg. The agent retains
+// it so post-registration housekeeping (Sprint H / #H3 — clear
+// agent.install_token after successful registration) can rewrite the
+// source file rather than just mutating the in-memory struct.
+func New(cfg *config.Config, configPath, version string) (*Agent, error) {
 	return &Agent{
-		cfg:     cfg,
-		version: version,
-		done:    make(chan struct{}),
+		cfg:        cfg,
+		configPath: configPath,
+		version:    version,
+		done:       make(chan struct{}),
 	}, nil
 }
 
@@ -144,7 +151,7 @@ func (a *Agent) run(ctx context.Context) error {
 	})
 
 	// --- Registration ------------------------------------------------------
-	reg := registration.New(cfg, store, preClient, a.version)
+	reg := registration.New(cfg, store, preClient, a.version, a.configPath)
 	agentID, tenantID, err := reg.EnsureRegistered(ctx)
 	if err != nil {
 		return fmt.Errorf("registration: %w", err)
