@@ -290,11 +290,12 @@
         },
         "spec": {
           "type": "object",
-          "description": "REQUIRED when possible=true. Same shape as a top-level executors/curated_ref block; describes how to undo the action.",
+          "description": "REQUIRED when possible=true. Same shape as a top-level executors/device_executors/curated_ref block; describes how to undo the action. For shell-transport actions use ``executors``; for ssh/netconf/snmp/cloud_api actions use ``device_executors``.",
           "additionalProperties": false,
           "properties": {
-            "executors":   { "$ref": "#/properties/executors" },
-            "curated_ref": { "$ref": "#/properties/curated_ref" }
+            "executors":        { "$ref": "#/properties/executors" },
+            "device_executors": { "$ref": "#/properties/device_executors" },
+            "curated_ref":      { "$ref": "#/properties/curated_ref" }
           }
         }
       },
