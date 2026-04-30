@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -198,6 +199,94 @@ func (c *Config) validate() error {
 	}
 	if c.Agent.DataDir == "" {
 		return fmt.Errorf("agent.data_dir is required")
+	}
+	return nil
+}
+
+// ClearInstallToken rewrites the YAML config file at path so that
+// agent.install_token holds an empty string. Called by the registrar
+// after a successful registration so the one-time token doesn't sit
+// in /etc/aione-agent/agent.yaml (Linux) or C:\ProgramData\AIOne\Agent\
+// agent.yaml (Windows) for the lifetime of the agent install.
+//
+// Sprint H / Task #H3. The token is single-use — once the registration
+// API has consumed it the value in the local YAML is meaningless to
+// the server but still readable by anyone with file-system access to
+// the host. Clearing it removes the lingering secret-shaped artifact
+// and makes "agent.yaml leaked" a non-event on the credential side.
+//
+// Implementation note — line-level regex replacement, not a YAML
+// round-trip. ``yaml.v3`` doesn't preserve comments or operator-
+// authored formatting (key ordering, blank-line layout, inline #
+// notes), so a Marshal()/WriteFile() cycle would silently rewrite
+// the operator's customized agent.yaml every successful registration.
+// Regex on the single line lets us touch ONLY the install_token
+// value while leaving every other byte of the file untouched.
+//
+// The replacement is idempotent — calling it on a config whose
+// install_token is already empty returns nil without writing.
+//
+// Returns nil on success or no-op. On any I/O / pattern failure
+// returns an error; the caller (registration.EnsureRegistered)
+// logs and continues — registration itself has already succeeded
+// and the token is already consumed server-side.
+func ClearInstallToken(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolving config path: %w", err)
+	}
+
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return fmt.Errorf("reading config %s: %w", absPath, err)
+	}
+
+	// Match the install_token: line in any of the three common shapes:
+	//   install_token: abcXYZ123              # bare scalar
+	//   install_token: "abcXYZ123"            # double-quoted
+	//   install_token: 'abcXYZ123'            # single-quoted
+	// Trailing inline comments (`  # one-time`) are preserved.
+	// Whitespace at start of line (YAML indent) is also preserved so
+	// nested blocks under a different parent key wouldn't be touched.
+	// Captures: 1=indent+key+colon+space, 2=existing value, 3=optional trailing comment.
+	pattern := regexp.MustCompile(`(?m)^(\s*install_token:\s*)("[^"]*"|'[^']*'|[^#\s][^\s#]*)(\s*#.*)?$`)
+
+	matched := false
+	out := pattern.ReplaceAllStringFunc(string(data), func(line string) string {
+		groups := pattern.FindStringSubmatch(line)
+		if len(groups) < 3 {
+			return line
+		}
+		// Already empty (covers `""`, `''`, or whitespace-only). Skip.
+		val := groups[2]
+		if val == `""` || val == `''` {
+			return line
+		}
+		matched = true
+		comment := ""
+		if len(groups) >= 4 {
+			comment = groups[3]
+		}
+		return groups[1] + `""` + comment
+	})
+
+	if !matched {
+		// No-op: the file either doesn't have an install_token line
+		// (operator removed it manually) or it's already empty. Either
+		// way, no write is needed.
+		return nil
+	}
+
+	// Preserve the file's mode bits where possible. Cert/key files are
+	// 0600; agent.yaml typically inherits whatever the installer set
+	// (commonly 0640 or 0644 depending on platform). Read it back and
+	// restore on write so we don't loosen perms accidentally.
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", absPath, err)
+	}
+	if err := os.WriteFile(absPath, []byte(out), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("rewriting config %s: %w", absPath, err)
 	}
 	return nil
 }

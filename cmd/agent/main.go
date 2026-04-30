@@ -43,7 +43,7 @@ func main() {
 
 	setupLogging(cfg)
 
-	svc, err := agentservice.New(cfg, version)
+	svc, err := agentservice.New(cfg, *configPath, version)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to create agent")
 	}

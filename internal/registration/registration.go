@@ -64,20 +64,29 @@ type stateFile struct {
 
 // Registrar manages the registration lifecycle.
 type Registrar struct {
-	cfg     *config.Config
-	store   *credentials.Store
-	client  *transport.Client
-	version string
+	cfg        *config.Config
+	configPath string // Source YAML path for the post-registration token clear (#H3)
+	store      *credentials.Store
+	client     *transport.Client
+	version    string
 }
 
 // New constructs a Registrar.  The transport client should be built without
 // client certs (pre-registration) and updated after a successful registration.
-func New(cfg *config.Config, store *credentials.Store, client *transport.Client, version string) *Registrar {
+//
+// configPath is the YAML file the cfg was loaded from. After a successful
+// registration the registrar rewrites that file in place to clear
+// agent.install_token (Sprint H / Task #H3) — the token is single-use and
+// shouldn't sit in /etc/aione-agent/agent.yaml for the lifetime of the
+// install. Pass "" to disable the clear (e.g. tests that don't have a
+// real on-disk config); the registrar log-warns and skips the rewrite.
+func New(cfg *config.Config, store *credentials.Store, client *transport.Client, version, configPath string) *Registrar {
 	return &Registrar{
-		cfg:     cfg,
-		store:   store,
-		client:  client,
-		version: version,
+		cfg:        cfg,
+		configPath: configPath,
+		store:      store,
+		client:     client,
+		version:    version,
 	}
 }
 
@@ -146,6 +155,24 @@ func (r *Registrar) EnsureRegistered(ctx context.Context) (agentID, tenantID str
 	// Persist registration state.
 	if err := r.saveState(resp.AgentID, resp.TenantID); err != nil {
 		log.Warn().Err(err).Msg("could not persist registration state")
+	}
+
+	// Sprint H / Task #H3 — clear the now-consumed install token from the
+	// on-disk YAML so it doesn't linger as a secret-shaped artifact for the
+	// lifetime of the agent install. Non-fatal: registration itself is done,
+	// the token is consumed server-side, the only impact of a write failure
+	// is that the local file still has the (now useless) token string.
+	if r.configPath == "" {
+		log.Debug().Msg("install_token clear skipped — empty configPath")
+	} else if err := config.ClearInstallToken(r.configPath); err != nil {
+		log.Warn().Err(err).Str("path", r.configPath).Msg("could not clear install_token from config")
+	} else {
+		// Mirror the in-memory cfg so subsequent EnsureRegistered calls in
+		// the same process don't see a stale value (purely defensive — the
+		// state-file gate above already short-circuits, but keeping the
+		// in-memory struct honest avoids surprises if the gate ever changes).
+		r.cfg.Agent.InstallToken = ""
+		log.Info().Str("path", r.configPath).Msg("install_token cleared from config")
 	}
 
 	log.Info().Str("agent_id", resp.AgentID).Msg("registration successful")
