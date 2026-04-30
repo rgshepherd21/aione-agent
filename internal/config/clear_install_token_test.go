@@ -25,6 +25,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -182,6 +183,18 @@ func TestClearInstallToken_NoInstallTokenLineIsNoop(t *testing.T) {
 }
 
 func TestClearInstallToken_PreservesMode(t *testing.T) {
+	// Skip on Windows: NTFS doesn't honor POSIX mode bits the way Linux/macOS
+	// do, so os.Chmod(0o600) succeeds but os.Stat().Mode().Perm() returns
+	// Windows-specific bits that don't equal 0o600. The underlying
+	// ClearInstallToken function still preserves whatever permissions the
+	// platform applies (we round-trip via os.Stat().Mode().Perm() in the
+	// implementation), the assertion just isn't meaningful here. The other
+	// 7 tests in this file exercise the content-level semantics, which DO
+	// work cross-platform.
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX mode-bit semantics don't apply on Windows NTFS")
+	}
+
 	// File mode must round-trip — agent.yaml typically inherits 0640
 	// from the installer; loosening to 0644 would be a security
 	// regression for a file that may contain other secrets in future.
