@@ -83,7 +83,7 @@ func (m *Manager) Fetch(ctx context.Context, actionID, credType string) (*Action
 	log.Debug().Str("action_id", actionID).Str("cred_type", credType).Msg("fetching credential from platform")
 
 	var cred ActionCred
-	if err := m.client.PostJSON(ctx, "/v1/credentials/issue", credIssueRequest{
+	if err := m.client.PostJSON(ctx, "/api/v1/credentials/issue", credIssueRequest{
 		ActionID: actionID,
 		CredType: credType,
 	}, &cred); err != nil {
