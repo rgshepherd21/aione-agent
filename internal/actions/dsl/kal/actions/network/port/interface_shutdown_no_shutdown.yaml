@@ -1,0 +1,79 @@
+# KAL action: interface_shutdown_no_shutdown
+# Cycle (shutdown then no shutdown) a Cisco IOS-XE interface. Used by
+# the autonomous remediation loop (Sprint E) to clear a stuck flapping
+# interface or stuck protocol state.
+#
+# Tier 2 (approval-gated) because the toggle drops traffic on the
+# interface for ~1 second during the down→up reconverge. Idempotent on
+# a healthy interface — final state matches initial state.
+#
+# Demo target for Sprint E end-to-end (E7): correlation rule
+# `link_flap` fires → proposer maps to this action → Claude reviews →
+# autonomy policy auto-approves at tier=1+risk=low+confidence>=0.85
+# (E4) → action dispatches via existing remediation_service chain →
+# state_capture pre/post brackets → rollback if post-check fails.
+
+id: interface_shutdown_no_shutdown
+version: 1
+tier: 2
+category: network/port
+description: "Cycle a Cisco IOS-XE switch interface (shutdown then no shutdown) to clear stuck protocol state. Tier 2 — approval-gated because the toggle disrupts traffic for ~1s. Idempotent: a healthy interface ends in the same state."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [interface_name]
+    properties:
+      interface_name:
+        type: string
+        description: "Interface to cycle (e.g. 'GigabitEthernet0/1')."
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z][A-Za-z0-9/.\\-]*$"
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "shutdown"
+      - "no shutdown"
+      - "end"
+  # Arista EOS (Sprint F / F3). Identical CLI to IOS-XE — shutdown / no-shutdown toggle works the same.
+  arista_eos:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "shutdown"
+      - "no shutdown"
+      - "end"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "Idempotent toggle — final state matches initial state on a healthy interface. If the post-check sees the interface still down, that's a hardware/cable problem the toggle can't fix; operator escalation is the right path, not a rollback."

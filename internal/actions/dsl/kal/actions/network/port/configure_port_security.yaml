@@ -1,0 +1,100 @@
+# KAL action: configure_port_security
+# Enable port-security on a Cisco IOS-XE access port with a maximum
+# MAC count and a violation action. Tier 2 — approval-gated.
+#
+# Pairs with clear_port_security_violation — when this action puts a
+# port into err-disable on violation, the operator (or the autonomous
+# loop, gated by E5) clears the err-disable state via the cleared-by
+# action. The mapping in remediation_proposer_service connects the
+# alert to the clear action; this action is what the operator
+# proactively sets up on a port to be protected.
+#
+# Idempotent: same params → same end state.
+
+id: configure_port_security
+version: 1
+tier: 2
+category: network/port
+description: "Enable port-security on a Cisco IOS-XE access interface with a max MAC count and a violation action. Tier 2 — approval-gated. Idempotent. Pairs with clear_port_security_violation for recovery."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [interface_name, max_macs, violation_action]
+    properties:
+      interface_name:
+        type: string
+        description: "Interface to protect (e.g. 'GigabitEthernet0/1'). Must already be in access mode — set that first via configure_port_access if needed."
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z][A-Za-z0-9/.\\-]*$"
+      max_macs:
+        type: integer
+        description: "Maximum number of source MACs the port will learn. 1 is the strictest setting (one device per port, common for endpoint ports); higher values fit phone+PC daisy chains. Cisco caps at 132 on older platforms; 1024 covers modern IOS-XE."
+        minimum: 1
+        maximum: 1024
+      violation_action:
+        type: string
+        description: "What the port does when the MAC limit is exceeded. shutdown puts the port into err-disable (operator must clear); restrict drops violating frames + logs; protect drops violating frames silently (least visible, least useful for operations)."
+        enum: ["shutdown", "restrict", "protect"]
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "switchport port-security"
+      - "switchport port-security maximum {{max_macs}}"
+      - "switchport port-security violation {{violation_action}}"
+      - "end"
+  # Arista EOS (Sprint F / F3.1). EOS supports `switchport port-security`
+  # with the same `maximum` keyword but only TWO of the three violation
+  # actions: `protect` and `shutdown`. EOS does NOT implement
+  # `restrict` — passing `restrict` produces an "Invalid input" device
+  # error which surfaces in the action_executions row's stderr for the
+  # operator. We mirror the schema rather than narrowing the EOS enum
+  # so the vendor-incompatibility shows up at exec time, consistent
+  # with the configure_port_channel pattern (F3 design — schema is
+  # vendor-agnostic, vendor differences materialize at the device).
+  # NOTE: not all EOS platforms implement port-security at all (some
+  # require feature-licensing). On unlicensed platforms the first
+  # `switchport port-security` line errors immediately and the rest
+  # of the script is skipped — fail-loud, no partial-config residue.
+  arista_eos:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "switchport port-security"
+      - "switchport port-security maximum {{max_macs}}"
+      - "switchport port-security violation {{violation_action}}"
+      - "end"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: none
+  post: none
+
+rollback:
+  possible: false
+  rationale: "Idempotent — to revert, re-issue configure_port_security with the prior values, or disable port-security entirely via a separate disable_port_security action (a future wave). Pre/post snapshot rollback waits on snapshot_interface_running_config."
