@@ -1,0 +1,83 @@
+# KAL action: set_port_speed
+# Pin a Cisco IOS-XE interface to a specific speed (or back to auto).
+# Tier 2 — approval-gated. A speed mismatch with the upstream device
+# kills the link instantly, so the operator should confirm both sides
+# agree before this fires.
+#
+# Idempotent: same speed → same end state.
+
+id: set_port_speed
+version: 1
+tier: 2
+category: network/port
+description: "Set the speed on a Cisco IOS-XE interface (10/100/1000/10000 Mb/s or 'auto'). Tier 2 — approval-gated. A unilateral speed change brings the link down if the upstream device doesn't match; operator must confirm both sides."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [interface_name, speed]
+    properties:
+      interface_name:
+        type: string
+        description: "Interface to configure (e.g. 'GigabitEthernet0/1')."
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z][A-Za-z0-9/.\\-]*$"
+      speed:
+        type: string
+        description: "Cisco speed keyword. 'auto' lets the port autonegotiate; numeric values pin both sides to that link rate."
+        enum: ["auto", "10", "100", "1000", "10000"]
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "speed {{speed}}"
+      - "end"
+  # Arista EOS (Sprint F / F3.1). Modern EOS (4.20+) and cEOS-lab accept
+  # the legacy `speed <n>` and `speed auto` forms at interface scope —
+  # they're parsed as aliases for the canonical `speed forced <n>full`
+  # / `speed auto` forms internally. On older EOS platforms the
+  # canonical `speed forced <n>full` is required and the legacy form
+  # produces an "Invalid input" error; in that case the operator gets a
+  # clear device-level failure surfaced via the action_executions
+  # stderr field. We mirror the IOS-XE commands to keep one parameter
+  # contract; a future F3.2 wave can introduce a vendor-specific
+  # canonical form if older-platform support becomes a requirement.
+  arista_eos:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "speed {{speed}}"
+      - "end"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: none
+  post: none
+
+rollback:
+  possible: false
+  rationale: "Idempotent — to revert, re-issue set_port_speed with the prior value. If the new speed broke the link with the upstream device, the operator's natural rollback is to re-set 'auto' from the same UX path. True pre/post snapshot rollback is deferred to a later wave."

@@ -1,0 +1,65 @@
+# KAL action: clear_bgp_neighbor
+# Reset a BGP session by clearing the neighbor on Cisco IOS-XE. Used by
+# the autonomous remediation loop (Sprint E / E1.1) to recover a stuck
+# Active or Idle neighbor that's not progressing through to Established.
+#
+# Tier 2 (approval-gated) because clearing the session drops all routes
+# from that peer for a few seconds while the BGP keepalive timer
+# re-establishes the session — a brief routing-table flap on the
+# affected paths.
+#
+# Mapped from correlation rule `bgp_neighbor_down` via E1's
+# remediation_proposer_service registry. Follow-up to interface_
+# shutdown_no_shutdown — same architectural pattern, different
+# protocol layer.
+
+id: clear_bgp_neighbor
+version: 1
+tier: 2
+category: network/routing
+description: "Clear a BGP session on Cisco IOS-XE to recover a stuck-Active or stuck-Idle neighbor. Tier 2 — drops all routes from the peer for a few seconds during reconvergence; the configured keepalive timer determines re-establishment speed."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [neighbor_ip]
+    properties:
+      neighbor_ip:
+        type: string
+        description: "BGP neighbor IPv4 address (e.g. '10.0.0.1')."
+        minLength: 7
+        maxLength: 15
+        pattern: "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "terminal length 0"
+    commands:
+      - "clear ip bgp {{neighbor_ip}}"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "There's no rollback for 'I cleared the BGP session' — the session re-establishes on its own with the configured keepalive timer. If the new state is worse than the old (the cleared session was masking a real problem upstream), operator escalation is the right path, not an artificial revert."

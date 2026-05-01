@@ -1,0 +1,78 @@
+# KAL action: clear_port_security_violation
+# Clear an err-disable state on a Cisco IOS-XE port that was triggered
+# by a port-security violation. Used by the autonomous remediation
+# loop (Sprint E / E1.1) to recover a port that an unexpected MAC
+# address tripped into err-disable.
+#
+# Tier 2 (approval-gated) because operator must trust that the
+# violating MAC was either legitimate (e.g. a phone re-registered with
+# a new chassis MAC) or no longer present on the wire — re-enabling
+# the port without that confirmation can re-trigger the violation
+# within seconds and put the port right back into err-disable.
+
+id: clear_port_security_violation
+version: 1
+tier: 2
+category: network/port
+description: "Clear an err-disable state on a Cisco IOS-XE port that was triggered by a port-security violation. Brings the port back into operational service. Tier 2 — re-enables traffic on a port that was disabled for a security reason; operator must confirm the violating MAC is gone or legitimate."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [interface_name]
+    properties:
+      interface_name:
+        type: string
+        description: "Interface in err-disable (e.g. 'GigabitEthernet0/1')."
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z][A-Za-z0-9/.\\-]*$"
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "terminal length 0"
+    commands:
+      - "clear errdisable interface {{interface_name}}"
+  # Arista EOS (Sprint F / F3.1). EOS does NOT have a `clear errdisable
+  # interface <name>` exec command — the canonical recovery from a
+  # port-security violation on EOS is to bounce the interface
+  # (shutdown then no-shutdown). This restores the port to operational
+  # state and re-arms port-security; if the violating MAC is still
+  # present the port re-triggers err-disable within seconds, same
+  # natural-rollback behavior as the Cisco branch's rationale below.
+  arista_eos:
+    pre_commands:
+      - "terminal length 0"
+      - "configure terminal"
+    commands:
+      - "interface {{interface_name}}"
+      - "shutdown"
+      - "no shutdown"
+      - "end"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "If the violating MAC is still present on the wire, the port will re-trigger err-disable on its own within seconds — that's the natural rollback. No artificial revert needed; in fact, attempting one would race with the device's own re-disable cycle and risk masking the real violation pattern from the operator."
