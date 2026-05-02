@@ -40,6 +40,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog/log"
+
 	"github.com/shepherdtech/aione-agent/internal/transport/sshclient"
 )
 
@@ -179,6 +181,17 @@ func RunDeviceAction(
 		}, fmt.Errorf("dsl: credential fetch: %w", err)
 	}
 
+	// Sprint-I diagnostic: log what the platform actually handed back.
+	// Helps debug cases where the agent's hint and the device's
+	// configured auth method disagree (drift) and the SSH handshake
+	// fails with an opaque "attempted methods [none]" error.
+	log.Debug().
+		Str("action_id", target.ActionExecutionID).
+		Str("cred_type_received", cred.Type).
+		Str("cred_principal", cred.Principal).
+		Int("cred_secret_len", len(cred.Secret)).
+		Msg("dsl: credential bundle received from platform")
+
 	// Resolve host: caller-provided target.Host wins; fall back to
 	// cred.Attrs["host"] which the vault may also carry. Same for port.
 	host := target.Host
@@ -223,6 +236,18 @@ func RunDeviceAction(
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
 			fmt.Errorf("dsl: unsupported credential type %q for SSH transport (expected ssh_key, password, or ssh_password)", cred.Type)
 	}
+
+	// Sprint-I diagnostic: confirm what we built right before Connect.
+	log.Debug().
+		Str("auth_method", string(sshCfg.AuthMethod)).
+		Bool("has_password", sshCfg.Password != "").
+		Int("password_len", len(sshCfg.Password)).
+		Bool("has_private_key", len(sshCfg.PrivateKeyPEM) > 0).
+		Str("host", sshCfg.Host).
+		Int("port", sshCfg.Port).
+		Str("user", sshCfg.User).
+		Msg("dsl: sshclient.Config built; calling Connect")
+
 	cli, err := sshclient.Connect(devCtx, sshCfg)
 	if err != nil {
 		return Outcome{
