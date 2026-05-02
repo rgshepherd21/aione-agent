@@ -37,6 +37,7 @@ func (c *ActionCred) Valid() bool {
 }
 
 type credIssueRequest struct {
+	AgentID  string `json:"agent_id"`
 	ActionID string `json:"action_id"`
 	CredType string `json:"cred_type"`
 }
@@ -49,16 +50,20 @@ type cachedCred struct {
 // Manager fetches and in-memory-caches short-lived credentials from the
 // platform API. It is safe for concurrent use.
 type Manager struct {
-	client *transport.Client
-	mu     sync.Mutex
-	cache  map[string]*cachedCred
+	client  *transport.Client
+	agentID string
+	mu      sync.Mutex
+	cache   map[string]*cachedCred
 }
 
 // NewManager creates a Manager backed by the given API client.
-func NewManager(client *transport.Client) *Manager {
+// agentID is sent on every credential-issue request body — backend's
+// CredentialIssueRequest schema requires it (app/schemas/credentials.py).
+func NewManager(client *transport.Client, agentID string) *Manager {
 	m := &Manager{
-		client: client,
-		cache:  make(map[string]*cachedCred),
+		client:  client,
+		agentID: agentID,
+		cache:   make(map[string]*cachedCred),
 	}
 	return m
 }
@@ -84,6 +89,7 @@ func (m *Manager) Fetch(ctx context.Context, actionID, credType string) (*Action
 
 	var cred ActionCred
 	if err := m.client.PostJSON(ctx, "/api/v1/credentials/issue", credIssueRequest{
+		AgentID:  m.agentID,
 		ActionID: actionID,
 		CredType: credType,
 	}, &cred); err != nil {
