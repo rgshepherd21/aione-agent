@@ -32,6 +32,10 @@ type fakeServer struct {
 	authedKey  ssh.PublicKey
 	authedUser string
 
+	// passwordOverride, when non-empty, drives PasswordCallback flows
+	// (newFakePasswordServer). Empty means key-auth is in use.
+	passwordOverride string
+
 	responses map[string]string // command → stdout
 
 	wg     sync.WaitGroup
@@ -445,6 +449,15 @@ func TestConnect_RequiresUserAndKey(t *testing.T) {
 		{"no host", Config{User: "x", PrivateKeyPEM: []byte("k")}},
 		{"no user", Config{Host: "127.0.0.1", PrivateKeyPEM: []byte("k")}},
 		{"no key", Config{Host: "127.0.0.1", User: "x"}},
+		{"explicit ssh_key with no key", Config{
+			Host: "127.0.0.1", User: "x", AuthMethod: AuthMethodPrivateKey,
+		}},
+		{"password auth with no password", Config{
+			Host: "127.0.0.1", User: "x", AuthMethod: AuthMethodPassword,
+		}},
+		{"unknown auth method", Config{
+			Host: "127.0.0.1", User: "x", AuthMethod: AuthMethod("kerberos"),
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -453,4 +466,157 @@ func TestConnect_RequiresUserAndKey(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ─── Password auth tests (Sprint I) ──────────────────────────────────────
+
+// newFakePasswordServer is a sibling of newFakeServer that authenticates
+// via PasswordCallback instead of PublicKeyCallback. Mirrors what real
+// IOS-XE / DevNet sandboxes look like to the agent.
+func newFakePasswordServer(t *testing.T, authedUser, authedPassword string, responses map[string]string) *fakeServer {
+	t.Helper()
+
+	hostSigner := newEd25519HostSigner(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	s := &fakeServer{
+		listener:   listener,
+		hostKey:    hostSigner,
+		authedUser: authedUser,
+		responses:  responses,
+		closed:     make(chan struct{}),
+	}
+	// Stash the password on the struct so handleConnPassword (below) can
+	// reach it without a separate field — keep blast radius small for
+	// this Sprint I add.
+	s.passwordOverride = authedPassword
+	go s.servePassword(t)
+	return s
+}
+
+func (s *fakeServer) servePassword(t *testing.T) {
+	for {
+		conn, err := s.listener.Accept()
+		if err != nil {
+			select {
+			case <-s.closed:
+				return
+			default:
+				t.Logf("accept: %v", err)
+				return
+			}
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handleConnPassword(t, conn)
+		}()
+	}
+}
+
+func (s *fakeServer) handleConnPassword(t *testing.T, nConn net.Conn) {
+	defer nConn.Close()
+
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(meta ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			if meta.User() != s.authedUser {
+				return nil, fmt.Errorf("unknown user %q", meta.User())
+			}
+			if string(password) != s.passwordOverride {
+				return nil, errors.New("password mismatch")
+			}
+			return &ssh.Permissions{}, nil
+		},
+	}
+	cfg.AddHostKey(s.hostKey)
+
+	sshConn, chans, reqs, err := ssh.NewServerConn(nConn, cfg)
+	if err != nil {
+		return
+	}
+	defer sshConn.Close()
+	go ssh.DiscardRequests(reqs)
+
+	for newCh := range chans {
+		if newCh.ChannelType() != "session" {
+			_ = newCh.Reject(ssh.UnknownChannelType, "only session supported")
+			continue
+		}
+		ch, chReqs, err := newCh.Accept()
+		if err != nil {
+			t.Logf("accept channel: %v", err)
+			continue
+		}
+		go s.handleSession(ch, chReqs)
+	}
+}
+
+func TestConnect_PasswordAuth_AcceptsCorrectPassword(t *testing.T) {
+	server := newFakePasswordServer(t, "developer", "lastorangerestoreball8876", map[string]string{
+		"show version": "Cisco IOS XE Software, Version 17.13.1\n",
+	})
+	defer server.Close()
+
+	host, port := splitHostPort(t, server.addr())
+	cli, err := Connect(context.Background(), Config{
+		Host:       host,
+		Port:       port,
+		User:       "developer",
+		AuthMethod: AuthMethodPassword,
+		Password:   "lastorangerestoreball8876",
+	})
+	if err != nil {
+		t.Fatalf("Connect with password: %v", err)
+	}
+	defer cli.Close()
+
+	out, err := cli.Run(context.Background(), "show version")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(out, "Cisco IOS XE Software") {
+		t.Errorf("unexpected output: %q", out)
+	}
+}
+
+func TestConnect_PasswordAuth_RejectsWrongPassword(t *testing.T) {
+	server := newFakePasswordServer(t, "developer", "right-password", map[string]string{})
+	defer server.Close()
+
+	host, port := splitHostPort(t, server.addr())
+	_, err := Connect(context.Background(), Config{
+		Host:       host,
+		Port:       port,
+		User:       "developer",
+		AuthMethod: AuthMethodPassword,
+		Password:   "wrong-password",
+	})
+	if err == nil {
+		t.Fatal("expected handshake failure with wrong password")
+	}
+}
+
+// ssh_password is an accepted alias for the password auth method —
+// mirrors the backend's CredType Literal which uses ssh_password.
+func TestConnect_SSHPasswordAlias(t *testing.T) {
+	server := newFakePasswordServer(t, "developer", "letmein", map[string]string{
+		"show version": "ok\n",
+	})
+	defer server.Close()
+
+	host, port := splitHostPort(t, server.addr())
+	cli, err := Connect(context.Background(), Config{
+		Host:       host,
+		Port:       port,
+		User:       "developer",
+		AuthMethod: AuthMethodSSHPassword,
+		Password:   "letmein",
+	})
+	if err != nil {
+		t.Fatalf("Connect with ssh_password alias: %v", err)
+	}
+	defer cli.Close()
 }

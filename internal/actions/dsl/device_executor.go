@@ -165,17 +165,18 @@ func RunDeviceAction(
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
 			errors.New("dsl: DeviceTarget.ActionExecutionID is required")
 	}
-	cred, err := fetcher.Fetch(ctx, target.ActionExecutionID, "ssh_key")
+	// Pass the action's pinned ``cred_type`` (from KAL YAML) as a hint —
+	// the platform now derives the actual auth method from the device row
+	// (Sprint I / migration 031) and may return a different type. We
+	// dispatch on the response's Type below, not on this hint.
+	hintedCredType, _ := action.Raw["cred_type"].(string)
+	cred, err := fetcher.Fetch(ctx, target.ActionExecutionID, hintedCredType)
 	if err != nil {
 		return Outcome{
 			StartedAt: startedAt,
 			EndedAt:   time.Now().UTC(),
 			Err:       fmt.Sprintf("credential fetch: %s", err),
 		}, fmt.Errorf("dsl: credential fetch: %w", err)
-	}
-	if cred.Type != "ssh_key" {
-		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-			fmt.Errorf("dsl: expected ssh_key credential, got %q", cred.Type)
 	}
 
 	// Resolve host: caller-provided target.Host wins; fall back to
@@ -200,13 +201,29 @@ func RunDeviceAction(
 	devCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cli, err := sshclient.Connect(devCtx, sshclient.Config{
-		Host:          host,
-		Port:          port,
-		User:          cred.Principal,
-		PrivateKeyPEM: []byte(cred.Secret),
-		PreCommands:   preCommands,
-	})
+	// Build the sshclient.Config with the right auth fields set based on
+	// what the platform issued. ``ssh_key`` (the historical default) puts
+	// Secret into PrivateKeyPEM; ``password``/``ssh_password`` puts it
+	// into Password. Anything else is rejected here with a clear error
+	// rather than letting sshclient surface a less specific one.
+	sshCfg := sshclient.Config{
+		Host:        host,
+		Port:        port,
+		User:        cred.Principal,
+		PreCommands: preCommands,
+	}
+	switch sshclient.AuthMethod(cred.Type) {
+	case sshclient.AuthMethodPrivateKey:
+		sshCfg.AuthMethod = sshclient.AuthMethodPrivateKey
+		sshCfg.PrivateKeyPEM = []byte(cred.Secret)
+	case sshclient.AuthMethodPassword, sshclient.AuthMethodSSHPassword:
+		sshCfg.AuthMethod = sshclient.AuthMethod(cred.Type)
+		sshCfg.Password = cred.Secret
+	default:
+		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+			fmt.Errorf("dsl: unsupported credential type %q for SSH transport (expected ssh_key, password, or ssh_password)", cred.Type)
+	}
+	cli, err := sshclient.Connect(devCtx, sshCfg)
 	if err != nil {
 		return Outcome{
 			StartedAt: startedAt,
