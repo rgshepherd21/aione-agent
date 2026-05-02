@@ -277,7 +277,7 @@ func (a *Agent) run(ctx context.Context) error {
 	//
 	// A periodic Purge sweep evicts expired entries every 5 min so the
 	// in-memory cache doesn't grow without bound on a busy agent.
-	credManager := credentials.NewManager(mTLSClient)
+	credManager := credentials.NewManager(mTLSClient, agentID)
 	credManager.StartPurger(ctx, 5*time.Minute)
 	exec.SetCredentialFetcher(executor.NewCredentialFetcher(credManager))
 
