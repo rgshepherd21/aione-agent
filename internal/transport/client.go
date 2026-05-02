@@ -16,6 +16,59 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// terminalErrorResponseCodes are server-side error codes returned alongside
+// HTTP 5xx where retrying won't change the outcome — the device config or
+// backend wiring is wrong and only an operator can fix it. Without this
+// allowlist the retry loop burns the caller's full context deadline (which
+// for the credential-fetch DSL step is 30s), surfacing as a "timed_out"
+// action even though the server responded almost immediately.
+//
+// The backend embeds this code as ``{"detail": {"code": "...", "message": "..."}}``
+// for any HTTPException raised with a dict detail. See:
+//   - app/core/errors.py (envelope)
+//   - app/services/credential_issuer_service.py (codes)
+//
+// Only 5xx codes need to live here — 4xx responses already short-circuit
+// retry on line 131. ``vault_lookup_failed`` and ``vault_fetch_error`` are
+// deliberately omitted: a vault flap or propagation delay is plausibly
+// transient, so a few retries are worthwhile.
+var terminalErrorResponseCodes = map[string]struct{}{
+	"device_credentials_unconfigured": {},
+	"vault_backend_not_implemented":   {},
+}
+
+// peekErrorCode extracts the JSON ``detail.code`` field from an error
+// response body and rewinds the body so downstream readers (PostJSON /
+// GetJSON) still see the full bytes. The original underlying body is
+// closed here, returning its connection to the pool.
+//
+// Returns "" if the body isn't a JSON error envelope or doesn't carry a
+// code — the caller treats absence as "unknown, default to retry".
+func peekErrorCode(resp *http.Response) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	// Always close the original body so the underlying connection is
+	// returned to the pool, even if the read errored partway.
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+
+	var envelope struct {
+		Detail struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"detail"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return ""
+	}
+	return envelope.Detail.Code
+}
+
 // ClientConfig holds the TLS material and retry policy.
 type ClientConfig struct {
 	BaseURL            string
@@ -121,6 +174,26 @@ func (c *Client) Do(ctx context.Context, method, path string, body interface{}) 
 		resp, err = c.doOnce(ctx, method, path, bodyBytes)
 		if err == nil && resp.StatusCode < 500 {
 			return resp, nil
+		}
+
+		// 5xx with a terminal error code: don't bother retrying. The server
+		// has told us this is a deterministic config failure (e.g. device
+		// has no credential_ref, vault backend not implemented). Retrying
+		// will just produce the same 5xx until the caller's context expires.
+		// We surface the response immediately so the action fails fast with
+		// the actual reason rather than as a timeout. peekErrorCode rewinds
+		// the body so PostJSON/GetJSON can still read it for the error text.
+		if err == nil && resp.StatusCode >= 500 {
+			code := peekErrorCode(resp)
+			if _, terminal := terminalErrorResponseCodes[code]; terminal {
+				log.Debug().
+					Str("method", method).
+					Str("path", path).
+					Int("status", resp.StatusCode).
+					Str("code", code).
+					Msg("server returned terminal error code; skipping retry")
+				return resp, nil
+			}
 		}
 
 		if resp != nil {

@@ -5,10 +5,15 @@
 // This trades some throughput for a clean security model — short-lived
 // per-action credentials never sit on a long-lived connection.
 //
-// Authentication: SSH private key (cred_type "ssh_key") for v1. The Secret
-// field of the platform-issued ActionCred is the PEM-encoded private key;
-// Principal is the SSH username. Password auth comes later if a customer
-// pulls for it.
+// Authentication: dispatches on Config.AuthMethod.
+//   - "ssh_key" — Secret is a PEM-encoded SSH private key (the historical
+//     v1 default; cEOS-lab and any tenant that hands out keys).
+//   - "password" / "ssh_password" — Secret is the SSH password literal
+//     (Cisco DevNet sandbox, devices behind RADIUS/TACACS where passwords
+//     are the only path).
+//
+// In both cases, Principal is the SSH username, sourced from the
+// platform-issued ActionCred bundle.
 //
 // Host key checking: configurable via Config.HostKeyCallback. The default is
 // ssh.InsecureIgnoreHostKey() — appropriate for greenfield lab use, where
@@ -28,6 +33,21 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+)
+
+// AuthMethod selects how Connect authenticates to the device. The string
+// values match what the platform's credential issuer returns in
+// ``ActionCred.Type`` so the executor can pass the value through verbatim.
+type AuthMethod string
+
+const (
+	// AuthMethodPrivateKey: Config.PrivateKeyPEM holds a PEM-encoded SSH key.
+	AuthMethodPrivateKey AuthMethod = "ssh_key"
+	// AuthMethodPassword: Config.Password holds the SSH password.
+	// "password" and "ssh_password" are accepted aliases — both surface
+	// from real-world vaults; we normalize on the way in.
+	AuthMethodPassword    AuthMethod = "password"
+	AuthMethodSSHPassword AuthMethod = "ssh_password"
 )
 
 // MaxOutputBytes caps per-command stdout/stderr capture. Sized for 'show
@@ -59,10 +79,22 @@ type Config struct {
 	// ActionCred.Principal.
 	User string
 
+	// AuthMethod selects between key and password auth. Defaults to
+	// AuthMethodPrivateKey when zero — preserves the pre-Sprint-I behavior
+	// where the only path was ssh_key, so existing call sites that haven't
+	// been updated yet keep working as long as PrivateKeyPEM is populated.
+	AuthMethod AuthMethod
+
 	// PrivateKeyPEM is the PEM-encoded SSH private key. Sourced from the
-	// platform-issued ActionCred.Secret. Never persisted to disk — used
-	// in-memory then discarded.
+	// platform-issued ActionCred.Secret when ``Type`` is ``ssh_key``.
+	// Never persisted to disk — used in-memory then discarded. Required
+	// when AuthMethod is AuthMethodPrivateKey.
 	PrivateKeyPEM []byte
+
+	// Password is the literal SSH password. Required when AuthMethod is
+	// AuthMethodPassword or AuthMethodSSHPassword. Same in-memory-only
+	// lifecycle as PrivateKeyPEM.
+	Password string
 
 	// HostKeyCallback validates the device's host key. Defaults to
 	// ssh.InsecureIgnoreHostKey() if nil — see package doc.
@@ -100,9 +132,6 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.User == "" {
 		return nil, errors.New("sshclient: User is required")
 	}
-	if len(cfg.PrivateKeyPEM) == 0 {
-		return nil, errors.New("sshclient: PrivateKeyPEM is required")
-	}
 	if cfg.Port == 0 {
 		cfg.Port = 22
 	}
@@ -117,14 +146,22 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 		cfg.HostKeyCallback = ssh.InsecureIgnoreHostKey() //nolint:gosec
 	}
 
-	signer, err := ssh.ParsePrivateKey(cfg.PrivateKeyPEM)
+	// Default AuthMethod — preserve pre-Sprint-I behavior for any caller
+	// that hasn't been updated to set the field. If they're passing
+	// PrivateKeyPEM, treat it as ssh_key; otherwise leave zero so the
+	// switch below errors with a clear message.
+	if cfg.AuthMethod == "" && len(cfg.PrivateKeyPEM) > 0 {
+		cfg.AuthMethod = AuthMethodPrivateKey
+	}
+
+	authMethods, err := buildAuthMethods(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("sshclient: parse private key: %w", err)
+		return nil, err
 	}
 
 	clientCfg := &ssh.ClientConfig{
 		User:            cfg.User,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Auth:            authMethods,
 		HostKeyCallback: cfg.HostKeyCallback,
 		Timeout:         cfg.DialTimeout,
 	}
@@ -245,6 +282,38 @@ func (c *Client) Close() error {
 	err := c.conn.Close()
 	c.conn = nil
 	return err
+}
+
+// buildAuthMethods translates the typed AuthMethod + secret material on
+// Config into the slice of ssh.AuthMethod that golang.org/x/crypto/ssh
+// expects in ClientConfig.Auth.
+//
+// Errors here are config errors at the caller, not transient device
+// errors — surfacing them with sshclient: prefixes keeps them easy to
+// distinguish from network failures during incident triage.
+func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
+	switch cfg.AuthMethod {
+	case AuthMethodPrivateKey:
+		if len(cfg.PrivateKeyPEM) == 0 {
+			return nil, errors.New("sshclient: PrivateKeyPEM is required for ssh_key auth")
+		}
+		signer, err := ssh.ParsePrivateKey(cfg.PrivateKeyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("sshclient: parse private key: %w", err)
+		}
+		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
+
+	case AuthMethodPassword, AuthMethodSSHPassword:
+		if cfg.Password == "" {
+			return nil, fmt.Errorf("sshclient: Password is required for %q auth", cfg.AuthMethod)
+		}
+		return []ssh.AuthMethod{ssh.Password(cfg.Password)}, nil
+
+	case "":
+		return nil, errors.New("sshclient: AuthMethod is required (set ssh_key, password, or ssh_password)")
+	}
+
+	return nil, fmt.Errorf("sshclient: unsupported AuthMethod %q (expected ssh_key, password, or ssh_password)", cfg.AuthMethod)
 }
 
 // cappedBuffer is a bytes.Buffer that silently drops writes past `cap`

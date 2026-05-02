@@ -465,3 +465,180 @@ func TestRunDeviceAction_HostFromCredentialAttrs(t *testing.T) {
 		t.Fatalf("expected Success: Err=%q", out.Err)
 	}
 }
+
+// ─── Sprint I: password-auth dispatch ────────────────────────────────────
+
+// startPasswordMiniServer is a sibling of startMiniServer that
+// authenticates via PasswordCallback. Mirrors the IOS-XE / DevNet
+// sandbox auth model.
+func startPasswordMiniServer(t *testing.T, user, password string, resp map[string]string) *miniServer {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("hostkey gen: %v", err)
+	}
+	hostSigner, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("host signer: %v", err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	s := &miniServer{
+		listener: ln,
+		host:     hostSigner,
+		user:     user,
+		resp:     resp,
+		closed:   make(chan struct{}),
+	}
+	go s.loopPassword(t, password)
+	return s
+}
+
+func (s *miniServer) loopPassword(t *testing.T, password string) {
+	for {
+		c, err := s.listener.Accept()
+		if err != nil {
+			select {
+			case <-s.closed:
+				return
+			default:
+				return
+			}
+		}
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.handlePassword(t, c, password)
+		}()
+	}
+}
+
+func (s *miniServer) handlePassword(_ *testing.T, c net.Conn, password string) {
+	defer c.Close()
+	cfg := &ssh.ServerConfig{
+		PasswordCallback: func(meta ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
+			if meta.User() != s.user {
+				return nil, fmt.Errorf("unknown user %q", meta.User())
+			}
+			if string(pw) != password {
+				return nil, errors.New("password mismatch")
+			}
+			return &ssh.Permissions{}, nil
+		},
+	}
+	cfg.AddHostKey(s.host)
+	conn, chans, reqs, err := ssh.NewServerConn(c, cfg)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	go ssh.DiscardRequests(reqs)
+	for newCh := range chans {
+		if newCh.ChannelType() != "session" {
+			_ = newCh.Reject(ssh.UnknownChannelType, "")
+			continue
+		}
+		ch, chReqs, err := newCh.Accept()
+		if err != nil {
+			continue
+		}
+		go func(ch ssh.Channel, reqs <-chan *ssh.Request) {
+			defer ch.Close()
+			for r := range reqs {
+				if r.Type != "exec" {
+					if r.WantReply {
+						_ = r.Reply(false, nil)
+					}
+					continue
+				}
+				cmd := readExec(r.Payload)
+				if r.WantReply {
+					_ = r.Reply(true, nil)
+				}
+				out, ok := s.resp[cmd]
+				if !ok {
+					_, _ = ch.Stderr().Write([]byte("unknown: " + cmd + "\n"))
+					_, _ = ch.SendRequest("exit-status", false, exitBytes(1))
+					return
+				}
+				_, _ = io.WriteString(ch, out)
+				_, _ = ch.SendRequest("exit-status", false, exitBytes(0))
+				return
+			}
+		}(ch, chReqs)
+	}
+}
+
+// TestRunDeviceAction_PasswordAuth_DispatchesViaCredType verifies the
+// Sprint I behavior: when the issuer hands back ``Type=ssh_password``,
+// the executor builds an sshclient.Config that uses Config.Password
+// (not PrivateKeyPEM) and the SSH handshake completes against a
+// password-only fake server.
+func TestRunDeviceAction_PasswordAuth_DispatchesViaCredType(t *testing.T) {
+	srv := startPasswordMiniServer(t, "developer", "lastorangerestoreball8876", map[string]string{
+		"terminal length 0":   "",
+		"show running-config": "Cisco IOS XE Software, Version 17.13.1\n",
+	})
+	defer srv.Close()
+	host, port := mustHostPort(t, srv.addr())
+
+	action := ciscoShowRunningConfigAction()
+	fetcher := &fakeFetcher{
+		cred: DeviceCredential{
+			Type:      "ssh_password",
+			Principal: "developer",
+			Secret:    "lastorangerestoreball8876",
+			Attrs:     map[string]string{"host": host, "port": fmt.Sprintf("%d", port)},
+			ExpiresAt: time.Now().Add(10 * time.Minute),
+		},
+	}
+
+	out, err := RunDeviceAction(context.Background(), action, nil,
+		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe"},
+		fetcher,
+	)
+	if err != nil {
+		t.Fatalf("RunDeviceAction with password auth: %v", err)
+	}
+	if !out.Success {
+		t.Fatalf("expected Success: Err=%q", out.Err)
+	}
+	if !strings.Contains(out.Stdout, "Cisco IOS XE Software") {
+		t.Errorf("unexpected stdout: %q", out.Stdout)
+	}
+}
+
+// TestRunDeviceAction_PasswordAlias verifies that ``password`` is also
+// accepted as a Type alias (some vault backends may emit either string).
+func TestRunDeviceAction_PasswordAlias(t *testing.T) {
+	srv := startPasswordMiniServer(t, "admin", "letmein", map[string]string{
+		"terminal length 0":   "",
+		"show running-config": "ok\n",
+	})
+	defer srv.Close()
+	host, port := mustHostPort(t, srv.addr())
+
+	action := ciscoShowRunningConfigAction()
+	fetcher := &fakeFetcher{
+		cred: DeviceCredential{
+			Type:      "password",
+			Principal: "admin",
+			Secret:    "letmein",
+			Attrs:     map[string]string{"host": host, "port": fmt.Sprintf("%d", port)},
+			ExpiresAt: time.Now().Add(10 * time.Minute),
+		},
+	}
+
+	out, err := RunDeviceAction(context.Background(), action, nil,
+		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe"},
+		fetcher,
+	)
+	if err != nil {
+		t.Fatalf("RunDeviceAction password alias: %v", err)
+	}
+	if !out.Success {
+		t.Fatalf("expected Success: Err=%q", out.Err)
+	}
+}
