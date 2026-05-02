@@ -307,7 +307,22 @@ func buildAuthMethods(cfg Config) ([]ssh.AuthMethod, error) {
 		if cfg.Password == "" {
 			return nil, fmt.Errorf("sshclient: Password is required for %q auth", cfg.AuthMethod)
 		}
-		return []ssh.AuthMethod{ssh.Password(cfg.Password)}, nil
+		// Many network devices advertise ``keyboard-interactive`` instead
+		// of (or in addition to) plain ``password`` auth — Arista cEOS
+		// is the canonical case. OpenSSH's CLI transparently falls back;
+		// golang.org/x/crypto/ssh requires us to explicitly offer both.
+		// Using the same password for every challenge prompt is the
+		// standard pattern for CLI/device auth (one prompt → one
+		// answer → success).
+		pw := cfg.Password
+		kbd := ssh.KeyboardInteractive(func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+			answers := make([]string, len(questions))
+			for i := range questions {
+				answers[i] = pw
+			}
+			return answers, nil
+		})
+		return []ssh.AuthMethod{ssh.Password(pw), kbd}, nil
 
 	case "":
 		return nil, errors.New("sshclient: AuthMethod is required (set ssh_key, password, or ssh_password)")
