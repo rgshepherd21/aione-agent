@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog/log"
+
+	"github.com/shepherdtech/aione-agent/internal/actions/dsl"
 )
 
 // RollbackCommand is the parsed form of a CommandTypeRollback
@@ -39,14 +41,19 @@ import (
 // ExecutionID is the parent ActionExecution.id — the agent uses
 // this (not CommandID) when fetching credentials for the device,
 // because the platform's credential issuer indexes on execution
-// rows, not rollback-attempt rows. The rollback executor's first
-// device-touching version will use this field to drive the
-// CredentialFetcher.
+// rows, not rollback-attempt rows.
+//
+// DeviceVendor / DeviceHost / DevicePort describe how to dial the
+// managed device for the rollback's persistent shell. Same fields
+// as execute_kal envelope; populated by the backend when the
+// execution row's device_id resolved to a real Device row. Empty /
+// zero when the action targeted the agent host rather than a
+// managed device (no rollback path exists for those today).
 //
 // PreState is the state_payload from the original action's
-// pre-capture. The rollback executor (Phase 2 follow-up) templates
-// it into the YAML's ``rollback.synthesis`` commands so the device
-// can be driven back to its captured baseline (e.g.
+// pre-capture. The rollback executor templates it into the YAML's
+// ``rollback.synthesis`` commands so the device can be driven back
+// to its captured baseline (e.g.
 // ``description {{pre_state.description}}``).
 type RollbackCommand struct {
 	CommandID    string
@@ -54,69 +61,126 @@ type RollbackCommand struct {
 	ActionIDSlug string
 	TenantID     string
 	DeviceID     string
+	DeviceVendor string
+	DeviceHost   string
+	DevicePort   int
 	PreState     map[string]interface{}
 	PayloadHash  string
 	CapturedAt   time.Time
 }
 
 // executeRollback is the inner-loop entry point invoked from the
-// SubmitRollback goroutine. It returns a Result the executor's
-// ResultSink ships to the dispatcher, which POSTs it to
-// ``/api/v1/agents/command-results`` exactly the same way an
-// execute_kal completion is posted.
+// SubmitRollback goroutine. It looks up the original action in the
+// DSL registry, hands off to ``dsl.RunRollback`` with a target
+// constructed from the rollback command + agent identity, and maps
+// the runner's outcome onto the executor's Result envelope.
 //
-// CURRENT BEHAVIOR (S2.b.2 phase 2 stub):
-//   - Logs that the rollback command was received with the
-//     parent execution id, action slug, and pre-state hash for
-//     audit traceability.
-//   - Returns a Result with Success=false and a clear stdout
-//     label so backend's ``try_record_rollback_result`` flips
-//     the RollbackAttempt row to a terminal status without the
-//     agent having actually touched the device.
-//   - The status='failed' choice is deliberate: until the YAML-
-//     driven synthesis runner lands, claiming success would be
-//     misleading on the rollback_attempts row. ``status='failed'``
-//     plus an explicit ``error_message`` ("agent rollback executor
-//     not yet implemented") is the honest signal.
+// Sprint follow-up S2.b.2 phase 2b. Replaces the earlier stub with
+// real synthesis-from-YAML execution: the runner reads
+// ``action.rollback.spec.device_executors.<vendor>``, templates
+// pre-state values into the commands, opens a persistent shell,
+// runs them, and emits a ``rollback_post`` capture when the
+// action's YAML state_capture.post is structured.
 //
-// FUTURE BEHAVIOR (next phase):
-//   1. Look up cmd.ActionIDSlug in the DSL registry.
-//   2. Pull the action's ``rollback.synthesis.<vendor>`` block.
-//   3. Fetch credentials using cmd.ExecutionID (not CommandID).
-//   4. Open a persistent shell, run synthesis pre_commands +
-//      commands templated against PreState + the original action's
-//      params.
-//   5. Capture rollback_post state, post via the existing
-//      capture.Sink.
-//   6. Return a Result reflecting the actual device outcome.
-func (e *Executor) executeRollback(_ context.Context, cmd RollbackCommand) Result {
+// ActionID on the Result intentionally carries the original action
+// slug rather than ``"rollback_<slug>"`` — backend's
+// try_record_rollback_result keys off CommandID
+// (== RollbackAttempt.id), so ActionID is purely informational.
+// Using the original slug makes the audit log read naturally as
+// "rollback of X".
+func (e *Executor) executeRollback(ctx context.Context, cmd RollbackCommand) Result {
+	now := time.Now()
+	res := Result{
+		ActionID:  cmd.ActionIDSlug,
+		CommandID: cmd.CommandID,
+		StartedAt: now,
+	}
+
 	log.Info().
 		Str("command_id", cmd.CommandID).
 		Str("execution_id", cmd.ExecutionID).
 		Str("action_id_slug", cmd.ActionIDSlug).
 		Str("device_id", cmd.DeviceID).
+		Str("device_vendor", cmd.DeviceVendor).
+		Str("device_host", cmd.DeviceHost).
 		Str("payload_hash", cmd.PayloadHash).
-		Msg("executor: rollback dispatch received (synthesis stub)")
+		Msg("executor: rollback dispatch received")
 
-	now := time.Now()
-	return Result{
-		// ActionID intentionally carries the original action slug
-		// rather than a synthetic "rollback_<slug>" value — the
-		// backend's try_record_rollback_result keys off CommandID
-		// (== RollbackAttempt.id), so ActionID is purely
-		// informational here. Using the original slug makes the
-		// audit log read naturally as "rollback of X".
-		ActionID:  cmd.ActionIDSlug,
-		CommandID: cmd.CommandID,
-		StartedAt: now,
-		EndedAt:   now,
-		Success:   false,
-		Err: fmt.Sprintf(
-			"agent rollback executor not yet implemented (S2.b.2 phase 2 stub); "+
-				"received rollback for execution_id=%s action=%s — backend "+
-				"will surface this as a failed RollbackAttempt with this "+
-				"error_message so the operator can intervene",
-			cmd.ExecutionID, cmd.ActionIDSlug,
-		),
+	if e.credFetcher == nil {
+		res.EndedAt = time.Now()
+		res.Err = "rollback received but executor has no credential fetcher; cannot dial device"
+		return res
 	}
+
+	// Look up the original action in the agent's DSL registry. The
+	// rollback's synthesis spec lives on the same YAML body the
+	// action originally dispatched from, so we don't need a separate
+	// rollback registry — same lookup-by-slug path the action took.
+	if !e.dslHasAction(cmd.ActionIDSlug) {
+		res.EndedAt = time.Now()
+		res.Err = fmt.Sprintf(
+			"rollback for action %q failed: action not in agent's KAL registry",
+			cmd.ActionIDSlug,
+		)
+		return res
+	}
+	reg, regErr := e.dslRegistry()
+	if regErr != nil {
+		res.EndedAt = time.Now()
+		res.Err = fmt.Sprintf("rollback registry load: %s", regErr)
+		return res
+	}
+	action := reg[cmd.ActionIDSlug]
+
+	// Pull the agent's identity from the capture context so the
+	// rollback_post capture's tenant_id / agent_id match the rest of
+	// the row's ancestry. Tenant from the rollback command's
+	// envelope wins when present (matches the execute_kal merge
+	// rule in executor.go's dispatch case).
+	ctxAgentID, ctxTenantID, sink := e.captureContextSnapshot()
+	tenantID := cmd.TenantID
+	if tenantID == "" {
+		tenantID = ctxTenantID
+	}
+
+	target := dsl.RollbackTarget{
+		CommandID:   cmd.CommandID,
+		ExecutionID: cmd.ExecutionID,
+		TenantID:    tenantID,
+		AgentID:     ctxAgentID,
+		DeviceID:    cmd.DeviceID,
+		Vendor:      cmd.DeviceVendor,
+		Host:        cmd.DeviceHost,
+		Port:        cmd.DevicePort,
+		PreState:    cmd.PreState,
+		// OriginalParams: the rollback command doesn't currently
+		// carry the original action's parameter map. Most rollback
+		// synthesis commands reference pre_state values rather than
+		// original params, so this is acceptable for v1. v2 should
+		// add an ``original_params`` field to the rollback wire
+		// payload so e.g. ``description {{description}}`` (a
+		// param-restoring rollback) becomes expressible.
+		OriginalParams: nil,
+	}
+
+	outcome, err := dsl.RunRollback(ctx, action, target, e.credFetcher, sink)
+	if err != nil {
+		// RunRollback only returns a non-nil error for caller bugs
+		// (nil action, missing fetcher / required identity). Surface
+		// as the Result.Err so the operator sees the cause.
+		res.EndedAt = time.Now()
+		res.Err = fmt.Sprintf("rollback runner: %s", err)
+		return res
+	}
+
+	res.StartedAt = outcome.StartedAt
+	res.EndedAt = outcome.EndedAt
+	res.Output = outcome.Stdout
+	res.TimedOut = outcome.TimedOut
+	if outcome.Success {
+		res.Success = true
+	} else {
+		res.Err = outcome.Err
+	}
+	return res
 }

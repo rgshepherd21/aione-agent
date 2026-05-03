@@ -38,10 +38,20 @@ var shellBlocklist = map[string]struct{}{
 	"wsl.exe": {}, "wsl": {},
 }
 
-// interpolationRE matches a `{{name}}` token in an executor arg. Greedy
-// match — `{{a}}stuff{{b}}` is two tokens. Mirrors _INTERPOLATION_RE in
-// the Python loader.
-var interpolationRE = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)
+// interpolationRE matches a `{{name}}` token in an executor arg.
+// Greedy match — `{{a}}stuff{{b}}` is two tokens. Mirrors
+// _INTERPOLATION_RE in the Python loader.
+//
+// Sprint follow-up S2.b.2 phase 2b extended ``name`` to allow
+// dotted identifiers (``{{pre_state.description}}``) so rollback
+// synthesis commands can reference pre-capture state. The lookup
+// is still a flat ``params[name]`` — the rollback executor
+// flattens ``pre_state["description"]`` into
+// ``params["pre_state.description"]`` before expansion, so this
+// regex change is the only signal-path edit. Existing single-
+// word interpolations (``{{interface_name}}``) keep working
+// unchanged.
+var interpolationRE = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\}\}`)
 
 // KALAction is the in-memory representation of a validated action. Mirrors
 // the Python dataclass. The full YAML map is preserved in Raw so the

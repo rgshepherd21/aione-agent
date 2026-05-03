@@ -29,13 +29,23 @@
 // requires HMAC-with-external-key and is deferred to Phase D.
 package capture
 
-// Capture type constants. Values MUST match the backend CHECK constraint
-// `capture_type IN ('pre','post')` in migration 019. Use these constants
-// everywhere instead of re-typing the literal strings so a future rename
+// Capture type constants. Values MUST match the backend CHECK
+// constraint ``capture_type IN ('pre','post','rollback_post')`` —
+// migration 019 added the first two; migration 020 widened the
+// allowlist with ``rollback_post``. Use these constants everywhere
+// instead of re-typing the literal strings so a future rename
 // surfaces as a compile error instead of a silent DB 422.
 const (
-	CaptureTypePre  = "pre"
+	CaptureTypePre = "pre"
+	// CaptureTypePost is the snapshot captured immediately after the
+	// action's commands ran. The state_capture validator service
+	// reads this row to evaluate YAML invariants.
 	CaptureTypePost = "post"
+	// CaptureTypeRollbackPost (Sprint follow-up S2.b.2 phase 2b) is
+	// the snapshot captured immediately after a rollback's synthesis
+	// commands ran. The backend's stage-5 rollback_validator reads
+	// it to confirm the device landed back at the pre-state hash.
+	CaptureTypeRollbackPost = "rollback_post"
 )
 
 // Capture method constants — free-form labels for how the payload was

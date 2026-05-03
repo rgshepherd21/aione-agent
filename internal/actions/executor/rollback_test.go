@@ -51,7 +51,13 @@ func (s *fanOutSink) waitFor(t *testing.T, n int, within time.Duration) []Result
 	return append([]Result(nil), s.results...)
 }
 
-func TestSubmitRollback_StubProducesFailedResult(t *testing.T) {
+// TestSubmitRollback_NoCredentialFetcherFailsCleanly verifies the
+// pre-condition guard: rollback executor without a credential
+// fetcher (an executor that's never been configured for SSH-
+// transport actions) returns a clear failure rather than crashing.
+// Sprint follow-up S2.b.2 phase 2b — replaces the earlier stub
+// test now that executeRollback runs the real synthesis path.
+func TestSubmitRollback_NoCredentialFetcherFailsCleanly(t *testing.T) {
 	t.Parallel()
 
 	e := New(
@@ -61,6 +67,7 @@ func TestSubmitRollback_StubProducesFailedResult(t *testing.T) {
 		},
 		nil,
 	)
+	// Note: no SetCredentialFetcher call.
 
 	sink := newFanOutSink()
 	e.SetResultSink(sink.Sink)
@@ -71,6 +78,9 @@ func TestSubmitRollback_StubProducesFailedResult(t *testing.T) {
 		ActionIDSlug: "interface_shutdown_no_shutdown",
 		TenantID:     "tenant-uuid",
 		DeviceID:     "device-uuid",
+		DeviceVendor: "arista_eos",
+		DeviceHost:   "10.0.0.1",
+		DevicePort:   22,
 		PreState:     map[string]interface{}{"line_protocol": "up"},
 		PayloadHash:  strings.Repeat("a", 64),
 		CapturedAt:   time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC),
@@ -91,16 +101,10 @@ func TestSubmitRollback_StubProducesFailedResult(t *testing.T) {
 			"interface_shutdown_no_shutdown")
 	}
 	if got.Success {
-		t.Errorf("expected Success=false (stub) — got true")
+		t.Errorf("expected Success=false (no fetcher) — got true")
 	}
-	if got.TimedOut {
-		t.Errorf("stub should not flag timed_out")
-	}
-	if got.Err == "" || !strings.Contains(got.Err, "not yet implemented") {
-		t.Errorf("expected stub error message, got %q", got.Err)
-	}
-	if got.Err == "" || !strings.Contains(got.Err, "exec-uuid-1") {
-		t.Errorf("error should reference parent execution_id, got %q", got.Err)
+	if got.Err == "" || !strings.Contains(got.Err, "credential fetcher") {
+		t.Errorf("expected credential-fetcher-missing error, got %q", got.Err)
 	}
 }
 

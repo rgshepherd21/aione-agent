@@ -311,6 +311,26 @@ func buildRollbackCommand(cmd PendingCommand) (executor.RollbackCommand, error) 
 	}
 	deviceID, _ := cmd.Payload["device_id"].(string) // optional
 
+	// Device targeting fields (S2.b.2 phase 2b). Same shape as the
+	// execute_kal envelope; the agent's rollback executor uses them
+	// to open a persistent shell for synthesis-from-YAML execution.
+	// Empty strings / zero on the wire mean "no managed device" —
+	// the rollback executor reports a clean failure rather than
+	// trying to dial a nonexistent host.
+	deviceVendor, _ := cmd.Payload["device_vendor"].(string)
+	deviceHost, _ := cmd.Payload["device_host"].(string)
+	var devicePort int
+	switch v := cmd.Payload["device_port"].(type) {
+	case float64:
+		devicePort = int(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			devicePort = int(n)
+		}
+	case int:
+		devicePort = v
+	}
+
 	preState, _ := cmd.Payload["pre_state"].(map[string]interface{})
 	if preState == nil {
 		return executor.RollbackCommand{}, fmt.Errorf("rollback payload missing pre_state map")
@@ -343,6 +363,9 @@ func buildRollbackCommand(cmd PendingCommand) (executor.RollbackCommand, error) 
 		ActionIDSlug: actionSlug,
 		TenantID:     tenantID,
 		DeviceID:     deviceID,
+		DeviceVendor: deviceVendor,
+		DeviceHost:   deviceHost,
+		DevicePort:   devicePort,
 		PreState:     preState,
 		PayloadHash:  payloadHash,
 		CapturedAt:   capturedAt,
