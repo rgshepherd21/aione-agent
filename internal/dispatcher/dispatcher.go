@@ -457,6 +457,12 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 	deviceID, _ := cmd.Payload["device_id"].(string)
 	tenantID, _ := cmd.Payload["tenant_id"].(string)
 
+	// CredentialRef (Sprint S3.b). Same off-wire, off-signature
+	// pattern as the device targeting fields. Backend populates on
+	// the AgentCommand envelope so the agent can decide between
+	// local-vault resolution (local://) and platform fetch.
+	credentialRef, _ := cmd.Payload["credential_ref"].(string)
+
 	return validation.Action{
 		ID:      id,
 		Type:    typ,
@@ -467,12 +473,13 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 		// row on command-results writeback. Distinct from the KAL action
 		// slug in `id`; see the Action struct doc for why this field is
 		// off-wire / off-signature.
-		CommandID:    cmd.CommandID,
-		DeviceVendor: deviceVendor,
-		DeviceHost:   deviceHost,
-		DevicePort:   devicePort,
-		DeviceID:     deviceID,
-		TenantID:     tenantID,
+		CommandID:     cmd.CommandID,
+		DeviceVendor:  deviceVendor,
+		DeviceHost:    deviceHost,
+		DevicePort:    devicePort,
+		DeviceID:      deviceID,
+		TenantID:      tenantID,
+		CredentialRef: credentialRef,
 	}, nil
 }
 

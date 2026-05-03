@@ -85,6 +85,14 @@ type Executor struct {
 	// a binary rebuild. Wired up in service.go alongside exec.New.
 	dslClient *dsl.RegistryClient
 
+	// vaultBackend (optional) is the agent-side credential vault used
+	// to resolve ``local://`` credential refs without going through the
+	// platform's /v1/credentials/issue endpoint. Sprint S3.b. When nil,
+	// any ``local://`` ref falls through to credFetcher and 404s on
+	// the issuer side (the V1.local invariant — backend MUST NOT
+	// resolve local://).
+	vaultBackend dsl.VaultBackend
+
 	// credFetcher (optional) is the credential fetcher used by SSH /
 	// NETCONF / SNMP / cloud_api transport actions to obtain short-
 	// lived per-action credentials from the platform. Sprint D / Task
@@ -103,6 +111,16 @@ type Executor struct {
 // to call any time before the first action dispatch.
 func (e *Executor) SetDSLClient(c *dsl.RegistryClient) {
 	e.dslClient = c
+}
+
+// SetVaultBackend installs the agent-side credential vault used to
+// resolve ``local://`` credential refs. Sprint S3.b. Safe to call at
+// most once during startup before any Submit calls race the setter.
+// Passing nil leaves the vault disabled — local:// refs then fall
+// through to the platform fetcher, which 404s by design (the
+// V1.local invariant).
+func (e *Executor) SetVaultBackend(b dsl.VaultBackend) {
+	e.vaultBackend = b
 }
 
 // SetCredentialFetcher attaches the per-action credential fetcher used
@@ -336,6 +354,15 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 					return ctxTenantID
 				}(),
 				DeviceID: action.DeviceID,
+				// Sprint S3.b: when CredentialRef begins with
+				// ``local://``, RunDeviceAction routes through
+				// LocalVault instead of the platform fetcher. Empty
+				// CredentialRef + non-nil LocalVault is fine — the
+				// vault just isn't consulted. Nil LocalVault + a
+				// local:// ref is the operator-error case
+				// RunDeviceAction surfaces with a clear message.
+				CredentialRef: action.CredentialRef,
+				LocalVault:    e.vaultBackend,
 			}
 			return e.runDSLAction(ctx, kalAction, action.Params, target)
 		}

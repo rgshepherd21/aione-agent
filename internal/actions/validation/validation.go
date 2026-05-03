@@ -67,6 +67,18 @@ type Action struct {
 	// so it isn't carried on the envelope).
 	DeviceID string `json:"-"`
 	TenantID string `json:"-"`
+
+	// CredentialRef (Sprint S3.b) is the device's vault locator —
+	// e.g. ``local://lab-router-1`` or ``dev://ssh_password/lab-1``.
+	// Off-wire, off-signature: rides on the outer AgentCommand
+	// envelope, not the signed KAL action body. Same population
+	// pattern as device_id/tenant_id. The agent's RunDeviceAction
+	// inspects the prefix to decide between local-vault resolution
+	// (``local://`` → agent's own vault.Backend) and platform fetch
+	// (everything else → /v1/credentials/issue). Empty for shell
+	// actions or for older backends that haven't started emitting
+	// the field yet.
+	CredentialRef string `json:"-"`
 }
 
 // ErrNotAllowed is returned when the action type is not in the allowlist.

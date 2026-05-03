@@ -44,8 +44,23 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/shepherdtech/aione-agent/internal/capture"
+	"github.com/shepherdtech/aione-agent/internal/credentials/vault"
 	"github.com/shepherdtech/aione-agent/internal/transport/sshclient"
 )
+
+// VaultBackend is the narrow interface RunDeviceAction uses to
+// resolve ``local://`` credential refs without going through the
+// platform fetcher. ``*vault.Backend`` satisfies it; production
+// callers wire the configured backend via Executor.SetVaultBackend.
+// Sprint S3.b.
+type VaultBackend = vault.Backend
+
+// localSchemePrefix is the URI prefix RunDeviceAction inspects to
+// route credential resolution. Anything starting with this prefix
+// goes to the local vault; everything else goes to the platform
+// fetcher. Defined here (not imported from a constant elsewhere)
+// because the agent owns the agent-side semantics of this string.
+const localSchemePrefix = "local://"
 
 // CredentialFetcher is the contract the device executor uses to obtain
 // short-lived per-action credentials. Implemented by
@@ -111,6 +126,24 @@ type DeviceTarget struct {
 	// the executor populates it whenever the dispatcher hands one in
 	// — every device-targeted action knows the device id.
 	DeviceID string
+
+	// CredentialRef is the device's vault locator (Sprint S3.b). When
+	// it begins with ``local://``, RunDeviceAction resolves the
+	// remainder of the URI through LocalVault without calling the
+	// platform fetcher — the V1.local invariant says backend code
+	// MUST NOT resolve local:// refs. For any other prefix
+	// (``dev://``, ``azure-kv://``, ``keyvault://``), the platform
+	// fetcher resolves and the agent never sees the raw ref. Empty
+	// when the platform didn't carry one through (older agent /
+	// older backend deploy) — the agent then falls through to the
+	// platform fetcher unconditionally.
+	CredentialRef string
+
+	// LocalVault (Sprint S3.b) is the agent-side credential vault
+	// used to resolve ``local://`` refs. Optional; nil leaves
+	// local:// resolution disabled (any local:// ref then falls
+	// through to the platform fetcher and 404s by design).
+	LocalVault VaultBackend
 }
 
 // RunDeviceAction is the SSH-transport sibling of Run. Caller provides the
@@ -193,39 +226,89 @@ func RunDeviceAction(
 			fmt.Errorf("dsl: action %q vendor %q has no command(s)", action.ID, target.Vendor)
 	}
 
-	// 5. Fetch credentials.
-	if fetcher == nil {
-		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-			errors.New("dsl: CredentialFetcher is required")
-	}
+	// 5. Resolve credentials. Sprint S3.b: when the device's
+	// credential_ref is a ``local://`` URI, route through the agent's
+	// own vault.Backend (target.LocalVault); otherwise fall through
+	// to the platform's per-action credential issuer
+	// (CredentialFetcher.Fetch). The split-plane invariant says the
+	// platform MUST NOT resolve local:// — see the V1.local
+	// architectural enforcement at
+	// aione-backend/tests/test_local_scheme_invariant.py.
 	if target.ActionExecutionID == "" {
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
 			errors.New("dsl: DeviceTarget.ActionExecutionID is required")
 	}
-	// Pass the action's pinned ``cred_type`` (from KAL YAML) as a hint —
-	// the platform now derives the actual auth method from the device row
-	// (Sprint I / migration 031) and may return a different type. We
-	// dispatch on the response's Type below, not on this hint.
 	hintedCredType, _ := action.Raw["cred_type"].(string)
-	cred, err := fetcher.Fetch(ctx, target.ActionExecutionID, hintedCredType)
-	if err != nil {
-		return Outcome{
-			StartedAt: startedAt,
-			EndedAt:   time.Now().UTC(),
-			Err:       fmt.Sprintf("credential fetch: %s", err),
-		}, fmt.Errorf("dsl: credential fetch: %w", err)
-	}
+	var cred DeviceCredential
+	if strings.HasPrefix(target.CredentialRef, localSchemePrefix) {
+		// Local resolution path. The vault MUST be wired, otherwise
+		// the action fails fast with a clear message rather than
+		// silently leaking a local:// ref to the platform fetcher.
+		if target.LocalVault == nil {
+			return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+				fmt.Errorf(
+					"dsl: action requires local vault for credential_ref=%q "+
+						"but no vault is wired (set vault.backend in agent.yaml)",
+					target.CredentialRef,
+				)
+		}
+		id := strings.TrimPrefix(target.CredentialRef, localSchemePrefix)
+		vc, err := target.LocalVault.Get(ctx, id)
+		if err != nil {
+			return Outcome{
+				StartedAt: startedAt,
+				EndedAt:   time.Now().UTC(),
+				Err:       fmt.Sprintf("local credential lookup: %s", err),
+			}, fmt.Errorf("dsl: local vault lookup: %w", err)
+		}
+		// Vault.Credentials → DeviceCredential. Schemas overlap
+		// 1:1 today, so the conversion is a field copy. ExpiresAt
+		// stays zero for vault-resolved creds — local creds don't
+		// have a per-action TTL the way platform-issued creds do.
+		cred = DeviceCredential{
+			Type:      vc.Type,
+			Principal: vc.Principal,
+			Secret:    vc.Secret,
+			Attrs:     vc.Attrs,
+		}
+		log.Debug().
+			Str("action_id", target.ActionExecutionID).
+			Str("credential_ref", target.CredentialRef).
+			Str("cred_type_received", cred.Type).
+			Str("cred_principal", cred.Principal).
+			Int("cred_secret_len", len(cred.Secret)).
+			Msg("dsl: credential bundle resolved from local vault")
+	} else {
+		// Platform fetch path — the historical default.
+		if fetcher == nil {
+			return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+				errors.New("dsl: CredentialFetcher is required")
+		}
+		// Pass the action's pinned ``cred_type`` (from KAL YAML) as a hint —
+		// the platform now derives the actual auth method from the device row
+		// (Sprint I / migration 031) and may return a different type. We
+		// dispatch on the response's Type below, not on this hint.
+		fetched, err := fetcher.Fetch(ctx, target.ActionExecutionID, hintedCredType)
+		if err != nil {
+			return Outcome{
+				StartedAt: startedAt,
+				EndedAt:   time.Now().UTC(),
+				Err:       fmt.Sprintf("credential fetch: %s", err),
+			}, fmt.Errorf("dsl: credential fetch: %w", err)
+		}
+		cred = fetched
 
-	// Sprint-I diagnostic: log what the platform actually handed back.
-	// Helps debug cases where the agent's hint and the device's
-	// configured auth method disagree (drift) and the SSH handshake
-	// fails with an opaque "attempted methods [none]" error.
-	log.Debug().
-		Str("action_id", target.ActionExecutionID).
-		Str("cred_type_received", cred.Type).
-		Str("cred_principal", cred.Principal).
-		Int("cred_secret_len", len(cred.Secret)).
-		Msg("dsl: credential bundle received from platform")
+		// Sprint-I diagnostic: log what the platform actually handed back.
+		// Helps debug cases where the agent's hint and the device's
+		// configured auth method disagree (drift) and the SSH handshake
+		// fails with an opaque "attempted methods [none]" error.
+		log.Debug().
+			Str("action_id", target.ActionExecutionID).
+			Str("cred_type_received", cred.Type).
+			Str("cred_principal", cred.Principal).
+			Int("cred_secret_len", len(cred.Secret)).
+			Msg("dsl: credential bundle received from platform")
+	}
 
 	// Resolve host: caller-provided target.Host wins; fall back to
 	// cred.Attrs["host"] which the vault may also carry. Same for port.

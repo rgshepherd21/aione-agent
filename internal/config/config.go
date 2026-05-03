@@ -19,7 +19,39 @@ type Config struct {
 	Actions   ActionsConfig   `yaml:"actions"`
 	Buffer    BufferConfig    `yaml:"buffer"`
 	Updater   UpdaterConfig   `yaml:"updater"`
+	Vault     VaultConfig     `yaml:"vault"`
 	Log       LogConfig       `yaml:"log"`
+}
+
+// VaultConfig controls the agent-side credential vault that resolves
+// ``local://`` credential references. Sprint S3.b.
+//
+// Fields default to the in-memory dev backend with no seed — safe
+// for first-run agents that don't yet handle local:// refs. Production
+// deployments override Backend to ``azure-kv`` and set AzureURL to
+// the customer's Azure Key Vault.
+type VaultConfig struct {
+	// Backend selects the vault implementation:
+	//   "dev"      — in-memory map seeded from DevSeedJSON or
+	//                DevSeedPath. Default.
+	//   "azure-kv" — Azure Key Vault via DefaultAzureCredential
+	//                (managed identity, az login, env vars, …).
+	Backend string `yaml:"backend"`
+
+	// AzureURL is the Azure Key Vault URL when Backend="azure-kv",
+	// e.g. "https://my-vault.vault.azure.net/".
+	AzureURL string `yaml:"azure_url"`
+
+	// DevSeedJSON is an inline JSON map of {id: {type, principal,
+	// secret, attrs}} pairs. Highest priority for the dev backend.
+	// Env-var friendly: set ``vault.dev_seed_json: "${AIONE_VAULT_SEED}"``
+	// in the YAML and populate the env var at deploy time.
+	DevSeedJSON string `yaml:"dev_seed_json"`
+
+	// DevSeedPath is a JSON file path. Lower priority than
+	// DevSeedJSON; ignored when the inline JSON is set. Useful for
+	// dev workflows where a file lives next to the binary.
+	DevSeedPath string `yaml:"dev_seed_path"`
 }
 
 // AgentConfig contains identity and runtime settings.
