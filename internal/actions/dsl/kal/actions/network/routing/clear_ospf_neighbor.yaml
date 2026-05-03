@@ -1,0 +1,94 @@
+# KAL action: clear_ospf_neighbor
+# Reset an OSPF adjacency, forcing the neighbor to re-establish
+# from scratch (Init → 2-Way → ExStart → Exchange → Loading →
+# Full). Tier 2 — the brief flap drops the LSDB-derived routes
+# learned through this neighbor for the duration of re-Sync, which
+# can cascade to short-lived black-holes in the area. Operator
+# approval is the right gate.
+#
+# Common alert → remediation pattern
+# ----------------------------------
+# OSPF neighbor stuck in EXSTART or LOADING; show ip ospf
+# neighbor confirms the state hasn't progressed for >SPF interval.
+# A clear forces re-negotiation, which usually unsticks MTU
+# mismatches, area config drift on the wire, or transient bug
+# states the protocol's own retry timers can't recover from.
+#
+# CLI surface
+# -----------
+# Cisco IOS-XE wants a process-id + optional neighbor-id:
+#   ``clear ip ospf <process> neighbor [<neighbor-id>]``
+# Arista EOS doesn't expose process-id at the CLI by default
+# (single-process-per-device assumption) and uses:
+#   ``clear ip ospf neighbor [<neighbor-id>]``
+# Both are scoped: when neighbor_id is omitted, ALL neighbors of
+# that process flap. v1 supports both forms via the parameter
+# schema below.
+
+id: clear_ospf_neighbor
+version: 1
+tier: 2
+category: network/routing
+description: "Reset an OSPF adjacency on a Cisco IOS-XE or Arista EOS device, forcing re-negotiation through the OSPF state machine. Used to unstick neighbors trapped in EXSTART or LOADING. Tier 2 — drops LSDB-derived routes from the neighbor for the duration of re-sync; operator approval gates production use."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [neighbor_id]
+    properties:
+      neighbor_id:
+        type: string
+        description: "OSPF router-id of the neighbor to flap (dotted-quad form, e.g. '10.1.1.1')."
+        pattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}$"
+        minLength: 7
+        maxLength: 15
+      process_id:
+        type: integer
+        description: "OSPF process id (Cisco IOS-XE only; ignored on Arista EOS which uses a single-process model). Defaults to 1 when omitted."
+        minimum: 1
+        maximum: 65535
+        default: 1
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear ip ospf {{process_id}} neighbor {{neighbor_id}}"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      # EOS: no process-id in the command. The DSL loader
+      # currently expands {{process_id}} unconditionally, but
+      # because EOS ignores the token, leaving it out of the
+      # command line is the right behavior.
+      - "clear ip ospf neighbor {{neighbor_id}}"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 60
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "OSPF adjacency state is owned by the protocol — there's no command to force a neighbor back into Full state. Re-establishment happens through the normal hello/DBD exchange. If post-clear adjacency fails to recover, the right remediation is at a different layer (interface MTU, area config) not undoing the clear."

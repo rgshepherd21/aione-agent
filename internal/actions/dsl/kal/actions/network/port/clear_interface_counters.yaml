@@ -1,0 +1,77 @@
+# KAL action: clear_interface_counters
+# Reset the statistics counters on a single interface. Tier 2 —
+# the interface keeps forwarding traffic (no L1/L2 disruption), but
+# this destroys historical observations: input/output rates, error
+# counts, drops, queue depth peaks, all reset to zero. Useful as a
+# scheduled "reset baseline before doing N-minute soak observation"
+# step in autonomous remediation pipelines, but operators want
+# approval because those counters often back ongoing investigations
+# and a wrong-time clear erases a forensic record.
+#
+# CLI surface
+# -----------
+# ``clear counters <interface>`` works identically on Cisco IOS-XE
+# and Arista EOS. Some platforms prompt ``Clear "show interface"
+# counters on this interface? [confirm]`` — both vendors auto-
+# accept when the SSH session is in privileged-EXEC mode without
+# terminal monitor / terminal interactive set, which is the
+# persistent shell's default state. ``terminal length 0`` is
+# included for symmetry with the rest of the catalog.
+
+id: clear_interface_counters
+version: 1
+tier: 2
+category: network/port
+description: "Reset statistics counters on a single interface (input/output rates, errors, drops, queue depth) to zero. Tier 2 — destroys historical observations even though traffic is uninterrupted; operator approval guards against erasing data that backs an active investigation."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [interface_name]
+    properties:
+      interface_name:
+        type: string
+        description: "Interface whose counters should be cleared (e.g. 'GigabitEthernet0/1', 'Ethernet1')."
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z][A-Za-z0-9/.\\-]*$"
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear counters {{interface_name}}"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear counters {{interface_name}}"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "Counters can't be unset to a prior value — there's no 'restore counters' command on either vendor. Once the historical baseline is gone it's gone; the next remediation cycle just builds a fresh observation window."

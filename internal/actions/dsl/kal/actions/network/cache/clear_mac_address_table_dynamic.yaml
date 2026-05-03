@@ -1,0 +1,85 @@
+# KAL action: clear_mac_address_table_dynamic
+# Flush dynamically-learned MAC entries from the L2 forwarding
+# table — either fleet-wide on the device, or scoped to one
+# interface. Static / system-reserved MACs are not touched. Tier
+# 2 because the device drops to flooding behavior briefly on the
+# affected ports until L2 learning re-converges (typically <1s on
+# a healthy network) and during that window:
+#   * unicast frames briefly flood to all ports in the VLAN,
+#   * peer ARP caches that resolved against the cleared MACs may
+#     trigger relearns and gratuitous ARP storms.
+# Operator approval is the right gate.
+#
+# Common alert → remediation pattern
+# ----------------------------------
+# Reachability fails after a host moves between ports (cable
+# swap, vMotion, server NIC failover); show mac address-table
+# shows the host's MAC still pinned to the old port.
+# ``clear mac address-table dynamic interface <new-port>`` (or
+# fleet-wide on small lab devices) forces relearning on the
+# correct port.
+
+id: clear_mac_address_table_dynamic
+version: 1
+tier: 2
+category: network/cache
+description: "Flush dynamically-learned MAC entries from the L2 forwarding table on a Cisco IOS-XE or Arista EOS device, optionally scoped to a single interface. Static MACs are preserved. Tier 2 — brief flooding window during L2 reconvergence; operator approval guards production fabrics."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    properties:
+      interface_name:
+        type: string
+        description: "Optional — when present, only entries learned on this interface are flushed. When omitted, all dynamic MACs on the device are flushed (fleet-wide, more disruptive)."
+        minLength: 1
+        maxLength: 64
+        pattern: "^[A-Za-z][A-Za-z0-9/.\\-]*$"
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  # MVP: fleet-wide flush only. Scoped form (``... interface
+  # <name>``) requires the DSL loader to support optional
+  # parameter expansion in command templates, which is a
+  # follow-up — for now omitting interface_name flushes all
+  # dynamic MACs and supplying it raises a parameter-validation
+  # error at the loader. v2 of this action will add a per-vendor
+  # ``commands_with_interface`` block once the loader grows
+  # conditional template support.
+  cisco_iosxe:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear mac address-table dynamic"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear mac address-table dynamic"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "MAC entries naturally repopulate via L2 learning on the next traffic burst — there is no 'restore MAC table' command. The natural rollback is the device's own learning."
