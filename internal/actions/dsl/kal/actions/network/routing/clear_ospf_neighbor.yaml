@@ -91,4 +91,4 @@ state_capture:
 
 rollback:
   possible: false
-  rationale: "OSPF adjacency state is owned by the protocol — there's no command to force a neighbor back into Full state. Re-establishment happens through the normal hello/DBD exchange. If post-clear adjacency fails to recover, the right remediation is at a different layer (interface MTU, area config) not undoing the clear."
+  rationale: "OSPF adjacency state is owned by the protocol. Re-establishment happens through the normal hello/DBD exchange."

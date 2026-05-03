@@ -82,4 +82,4 @@ state_capture:
 
 rollback:
   possible: false
-  rationale: "MAC entries naturally repopulate via L2 learning on the next traffic burst — there is no 'restore MAC table' command. The natural rollback is the device's own learning."
+  rationale: "MAC entries naturally repopulate via L2 learning on the next traffic burst."
