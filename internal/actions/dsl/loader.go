@@ -326,6 +326,21 @@ func checkInterpolationCoverage(raw map[string]interface{}, p string) error {
 	checkString := func(s, where string) error {
 		for _, m := range interpolationRE.FindAllStringSubmatch(s, -1) {
 			name := m[1]
+			// Sprint follow-up S2.b.2 phase 2c: allowlist
+			// ``pre_state.<key>`` references. These resolve at
+			// runtime from the rollback command's pre_state
+			// payload (flattened into params under the
+			// ``pre_state.`` prefix by the rollback runner) and
+			// CAN'T be enumerated at YAML-load time — the keys
+			// depend on which fields the action's vendor parser
+			// happens to extract. Treating them as well-formed
+			// here is the right tradeoff: if the parser doesn't
+			// supply the key at runtime, the rollback fails with
+			// a clear error pointing at the missing pre_state
+			// field; if it does supply it, expansion succeeds.
+			if strings.HasPrefix(name, "pre_state.") {
+				continue
+			}
 			if _, ok := declared[name]; !ok {
 				return loadErrf(p,
 					"%s interpolation '{{%s}}' is not a declared parameter or parameter_transform",

@@ -147,12 +147,23 @@ func RunRollback(
 	// with flattened pre_state under the ``pre_state.`` prefix. The
 	// regex in loader.go was extended to allow dotted names so
 	// ``{{pre_state.description}}`` lookups land on the right entry.
-	params := make(map[string]interface{}, len(target.OriginalParams)+len(target.PreState))
-	for k, v := range target.OriginalParams {
-		params[k] = v
-	}
+	//
+	// We also expose each pre_state value under its bare key as a
+	// fallback. This lets state_capture's existing commands (which
+	// were authored against the action's params, like
+	// ``{{interface_name}}``) resolve cleanly during rollback —
+	// pre_state entries are the canonical fields the action's
+	// parser produces, and most action params share names with those
+	// fields. OriginalParams (when populated by a future wire-format
+	// extension) wins over the pre_state fallback so a real param
+	// value never gets silently shadowed.
+	params := make(map[string]interface{}, len(target.OriginalParams)+2*len(target.PreState))
 	for k, v := range target.PreState {
 		params["pre_state."+k] = v
+		params[k] = v // bare-key fallback
+	}
+	for k, v := range target.OriginalParams {
+		params[k] = v // overwrites the pre_state fallback when present
 	}
 
 	preCommands, err := expandStringList(vendorBlock["pre_commands"], params)
