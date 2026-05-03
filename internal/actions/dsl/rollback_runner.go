@@ -70,6 +70,16 @@ type RollbackTarget struct {
 	Port         int
 	PreState     map[string]interface{}
 	OriginalParams map[string]interface{} // params from the original action
+
+	// CredentialRef + LocalVault mirror the same-named fields on
+	// DeviceTarget (Sprint follow-up Bucket A.2 / HIGH#2 from the
+	// post-S4 code review). When CredentialRef begins with
+	// ``local://`` the runner resolves it through LocalVault rather
+	// than calling the platform fetcher — same V1.local invariant the
+	// action body honors. Without this branch, rollbacks of a
+	// local-vault-backed device would 404 at the platform issuer.
+	CredentialRef string
+	LocalVault    VaultBackend
 }
 
 // RollbackOutcome is the runner's return shape — narrower than
@@ -187,8 +197,20 @@ func RunRollback(
 	// 3. Fetch credentials. Use ExecutionID (parent action_execution)
 	// — the credential issuer indexes on action_executions, not
 	// rollback_attempts.
+	//
+	// Bucket A.2 / HIGH#2: route through resolveCredential so a
+	// local://-backed device's rollback hits the agent's own vault
+	// (the V1.local invariant). Pre-A.2 the rollback unconditionally
+	// called the platform fetcher, which 404s for local:// refs.
 	hintedCredType, _ := action.Raw["cred_type"].(string)
-	cred, err := fetcher.Fetch(ctx, target.ExecutionID, hintedCredType)
+	cred, err := resolveCredential(ctx, credResolveInput{
+		LogActionID:   target.CommandID,
+		FetchID:       target.ExecutionID,
+		CredentialRef: target.CredentialRef,
+		HintedType:    hintedCredType,
+		LocalVault:    target.LocalVault,
+		Fetcher:       fetcher,
+	})
 	if err != nil {
 		return failOutcome(startedAt,
 			fmt.Sprintf("rollback credential fetch: %s", err),

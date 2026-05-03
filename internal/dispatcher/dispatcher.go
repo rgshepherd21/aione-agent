@@ -357,18 +357,25 @@ func buildRollbackCommand(cmd PendingCommand) (executor.RollbackCommand, error) 
 		}
 	}
 
+	// CredentialRef rides on the rollback envelope alongside the
+	// device targeting fields (Sprint follow-up Bucket A.2 / HIGH#2).
+	// Off-signature, like the device fields — the agent uses it to
+	// decide between local-vault and platform-fetcher resolution.
+	credentialRef, _ := cmd.Payload["credential_ref"].(string)
+
 	return executor.RollbackCommand{
-		CommandID:    cmd.CommandID,
-		ExecutionID:  executionID,
-		ActionIDSlug: actionSlug,
-		TenantID:     tenantID,
-		DeviceID:     deviceID,
-		DeviceVendor: deviceVendor,
-		DeviceHost:   deviceHost,
-		DevicePort:   devicePort,
-		PreState:     preState,
-		PayloadHash:  payloadHash,
-		CapturedAt:   capturedAt,
+		CommandID:     cmd.CommandID,
+		ExecutionID:   executionID,
+		ActionIDSlug:  actionSlug,
+		TenantID:      tenantID,
+		DeviceID:      deviceID,
+		DeviceVendor:  deviceVendor,
+		DeviceHost:    deviceHost,
+		DevicePort:    devicePort,
+		PreState:      preState,
+		PayloadHash:   payloadHash,
+		CapturedAt:    capturedAt,
+		CredentialRef: credentialRef,
 	}, nil
 }
 

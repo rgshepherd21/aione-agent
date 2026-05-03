@@ -67,6 +67,14 @@ type RollbackCommand struct {
 	PreState     map[string]interface{}
 	PayloadHash  string
 	CapturedAt   time.Time
+
+	// CredentialRef rides on the rollback envelope alongside the
+	// device targeting fields. Populated by the backend's
+	// rollback_service.build_rollback_command from the Device row's
+	// credential_ref column. Bucket A.2 / HIGH#2 from the post-S4
+	// code review — without this field the rollback path can't honor
+	// the V1.local invariant for local://-backed devices.
+	CredentialRef string
 }
 
 // executeRollback is the inner-loop entry point invoked from the
@@ -161,6 +169,12 @@ func (e *Executor) executeRollback(ctx context.Context, cmd RollbackCommand) Res
 		// payload so e.g. ``description {{description}}`` (a
 		// param-restoring rollback) becomes expressible.
 		OriginalParams: nil,
+		// CredentialRef + LocalVault — Bucket A.2 / HIGH#2. The
+		// rollback path now honors the same V1.local invariant as
+		// the action body: local:// refs route to the agent's vault,
+		// everything else goes to the platform fetcher.
+		CredentialRef: cmd.CredentialRef,
+		LocalVault:    e.vaultBackend,
 	}
 
 	outcome, err := dsl.RunRollback(ctx, action, target, e.credFetcher, sink)

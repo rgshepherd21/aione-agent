@@ -326,6 +326,11 @@
             "minLength": 1,
             "maxLength": 256
           }
+        },
+        "pre_required": {
+          "type": "boolean",
+          "description": "When true, a failure to collect/parse the pre-capture aborts the action body before any device mutation. Default false preserves the historical posture: pre-failures log + continue, the action runs against an unobserved baseline, and the validator decides 'not_applicable' (no pre row to compare). Set true on actions where running blind is unsafe — e.g. a configuration restore that must know the original config to make the diff meaningful. Bucket A.2 / MEDIUM#9 from the post-S4 code review.",
+          "default": false
         }
       }
     },

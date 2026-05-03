@@ -38,6 +38,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -239,75 +240,25 @@ func RunDeviceAction(
 			errors.New("dsl: DeviceTarget.ActionExecutionID is required")
 	}
 	hintedCredType, _ := action.Raw["cred_type"].(string)
-	var cred DeviceCredential
-	if strings.HasPrefix(target.CredentialRef, localSchemePrefix) {
-		// Local resolution path. The vault MUST be wired, otherwise
-		// the action fails fast with a clear message rather than
-		// silently leaking a local:// ref to the platform fetcher.
-		if target.LocalVault == nil {
-			return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-				fmt.Errorf(
-					"dsl: action requires local vault for credential_ref=%q "+
-						"but no vault is wired (set vault.backend in agent.yaml)",
-					target.CredentialRef,
-				)
-		}
-		id := strings.TrimPrefix(target.CredentialRef, localSchemePrefix)
-		vc, err := target.LocalVault.Get(ctx, id)
-		if err != nil {
-			return Outcome{
-				StartedAt: startedAt,
-				EndedAt:   time.Now().UTC(),
-				Err:       fmt.Sprintf("local credential lookup: %s", err),
-			}, fmt.Errorf("dsl: local vault lookup: %w", err)
-		}
-		// Vault.Credentials → DeviceCredential. Schemas overlap
-		// 1:1 today, so the conversion is a field copy. ExpiresAt
-		// stays zero for vault-resolved creds — local creds don't
-		// have a per-action TTL the way platform-issued creds do.
-		cred = DeviceCredential{
-			Type:      vc.Type,
-			Principal: vc.Principal,
-			Secret:    vc.Secret,
-			Attrs:     vc.Attrs,
-		}
-		log.Debug().
-			Str("action_id", target.ActionExecutionID).
-			Str("credential_ref", target.CredentialRef).
-			Str("cred_type_received", cred.Type).
-			Str("cred_principal", cred.Principal).
-			Int("cred_secret_len", len(cred.Secret)).
-			Msg("dsl: credential bundle resolved from local vault")
-	} else {
-		// Platform fetch path — the historical default.
-		if fetcher == nil {
-			return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-				errors.New("dsl: CredentialFetcher is required")
-		}
-		// Pass the action's pinned ``cred_type`` (from KAL YAML) as a hint —
-		// the platform now derives the actual auth method from the device row
-		// (Sprint I / migration 031) and may return a different type. We
-		// dispatch on the response's Type below, not on this hint.
-		fetched, err := fetcher.Fetch(ctx, target.ActionExecutionID, hintedCredType)
-		if err != nil {
-			return Outcome{
-				StartedAt: startedAt,
-				EndedAt:   time.Now().UTC(),
-				Err:       fmt.Sprintf("credential fetch: %s", err),
-			}, fmt.Errorf("dsl: credential fetch: %w", err)
-		}
-		cred = fetched
-
-		// Sprint-I diagnostic: log what the platform actually handed back.
-		// Helps debug cases where the agent's hint and the device's
-		// configured auth method disagree (drift) and the SSH handshake
-		// fails with an opaque "attempted methods [none]" error.
-		log.Debug().
-			Str("action_id", target.ActionExecutionID).
-			Str("cred_type_received", cred.Type).
-			Str("cred_principal", cred.Principal).
-			Int("cred_secret_len", len(cred.Secret)).
-			Msg("dsl: credential bundle received from platform")
+	// Bucket A.2 / MEDIUM#7: local:// vs platform-fetcher branch
+	// extracted to ``resolveCredential`` so RunRollback can reuse it
+	// (HIGH#2). Behavior identical to the prior inline branch.
+	cred, credErr := resolveCredential(ctx, credResolveInput{
+		LogActionID:   target.ActionExecutionID,
+		FetchID:       target.ActionExecutionID,
+		CredentialRef: target.CredentialRef,
+		HintedType:    hintedCredType,
+		LocalVault:    target.LocalVault,
+		Fetcher:       fetcher,
+	})
+	if credErr != nil {
+		// Distinguish "wrapped error from a fetcher/vault" vs caller-
+		// bug error so the Outcome.Err is informative either way.
+		return Outcome{
+			StartedAt: startedAt,
+			EndedAt:   time.Now().UTC(),
+			Err:       credErr.Error(),
+		}, credErr
 	}
 
 	// Resolve host: caller-provided target.Host wins; fall back to
@@ -467,11 +418,23 @@ func RunDeviceAction(
 				Msg("dsl: state-capture pre post failed (continuing action)")
 		}
 		if capErr != nil {
-			// A pre-capture failure doesn't abort the action — we
-			// still have a row on the backend (with succeeded=false)
-			// that signals the validator to be conservative. Log the
-			// error so the operator can see the cause without digging
-			// into the row.
+			// Bucket A.2 / MEDIUM#9: when the action's YAML opts in
+			// via ``state_capture.pre_required: true``, a pre-failure
+			// aborts the action BEFORE any device mutation. Default
+			// (false) preserves the historical log-and-continue
+			// posture — the failed capture row's succeeded=false
+			// signals the validator to be conservative.
+			if captureSpec.PreRequired {
+				log.Warn().Err(capErr).
+					Str("action_execution_id", target.ActionExecutionID).
+					Msg("dsl: state-capture pre required but collector failed; aborting action body")
+				out.EndedAt = time.Now().UTC()
+				out.ExitCode = -1
+				out.Err = fmt.Sprintf("state-capture pre required: %s", capErr)
+				out.AttemptErrs = append(out.AttemptErrs, out.Err)
+				return out, nil
+			}
+			// Default path: log + continue.
 			log.Warn().Err(capErr).
 				Str("action_execution_id", target.ActionExecutionID).
 				Msg("dsl: state-capture pre collector failed")
@@ -577,18 +540,19 @@ func expandStringList(raw interface{}, params map[string]interface{}) ([]string,
 	return out, nil
 }
 
-// atoiSafe parses an integer from a string without bringing in strconv
-// just for one call site. Returns (0, false) on any parse failure.
+// atoiSafe parses an integer from a string. Returns (0, false) on any
+// parse failure. Bucket A.2 / LOW#11: was a hand-rolled loop to avoid
+// importing strconv; that decision pre-dated the package's growth and
+// the readability win of strconv.Atoi (well-known idiom, handles
+// signed values, leading whitespace, etc.) is worth the import.
 func atoiSafe(s string) (int, bool) {
-	if s == "" {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
 		return 0, false
 	}
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, false
-		}
-		n = n*10 + int(c-'0')
+	n, err := strconv.Atoi(trimmed)
+	if err != nil {
+		return 0, false
 	}
 	return n, true
 }
