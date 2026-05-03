@@ -82,6 +82,15 @@ type stateCaptureSpec struct {
 	Pre        statePhase
 	Post       statePhase
 	Invariants []string // free-form for MVP; backend validator interprets
+
+	// PreRequired (Sprint follow-up Bucket A.2 / MEDIUM#9): when
+	// true, RunDeviceAction aborts the action body if pre-capture
+	// collection fails, rather than logging + continuing. Default
+	// false preserves the historical posture: actions where running
+	// against an unobserved baseline is acceptable. Set true on
+	// actions whose body cannot be safely run without a known
+	// pre-state (e.g. a config restore that diffs against pre).
+	PreRequired bool
 }
 
 // readStateCaptureSpec extracts the state_capture block from a KAL
@@ -113,6 +122,10 @@ func readStateCaptureSpec(raw map[string]interface{}, params map[string]interfac
 				out.Invariants = append(out.Invariants, s)
 			}
 		}
+	}
+	// pre_required (Bucket A.2 / MEDIUM#9). YAML omits → false.
+	if pr, ok := block["pre_required"].(bool); ok {
+		out.PreRequired = pr
 	}
 	return out, nil
 }

@@ -17,7 +17,7 @@ id: interface_shutdown_no_shutdown
 version: 1
 tier: 2
 category: network/port
-description: "Cycle a Cisco IOS-XE switch interface (shutdown then no shutdown) to clear stuck protocol state. Tier 2 — approval-gated because the toggle disrupts traffic for ~1s. Idempotent: a healthy interface ends in the same state."
+description: "Cycle a Cisco IOS-XE or Arista EOS switch interface (shutdown then no shutdown) to clear stuck protocol state. Multi-vendor — same CLI on both platforms. Tier 2 — approval-gated because the toggle disrupts traffic for ~1s. Idempotent: a healthy interface ends in the same state."
 implementation: dsl
 patent_claim_refs: ["4f", "4g"]
 

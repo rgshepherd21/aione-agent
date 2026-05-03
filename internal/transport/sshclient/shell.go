@@ -49,10 +49,22 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// shellReadBufSize bounds the ring of unconsumed stdout bytes the
-// reader goroutine appends to. Sized for a Cisco "show tech-support"
-// (~256 KB) plus headroom; smaller commands rarely fill it.
-const shellReadBufSize = 512 * 1024
+// shellReadBufSize bounds the unconsumed stdout bytes the reader
+// goroutine appends to. Sized to comfortably hold a fully-populated
+// ``show running-config`` (~1-3 MB on a real Catalyst / Nexus /
+// cEOS box, after the persistent-shell ``terminal length 0`` disables
+// the pager) with headroom. Bumped from 512 KiB → 4 MiB in Sprint
+// follow-up Bucket A.2 (HIGH#1 from the post-S4 code review): the
+// 512 KiB cap silently truncated ``show running-config`` output on
+// devices with non-trivial config, which would have broken the
+// config-snapshot pipeline that S5's discovery walker relies on.
+//
+// On overflow the reader sets a terminal error (ErrShellOutputOverflow)
+// and stops consuming — Send returns that error to the caller rather
+// than silently dropping the head of the buffer. Loud-fail beats
+// silent-truncation when the output drives downstream parsers like
+// the topology graph or config snapshots.
+const shellReadBufSize = 4 * 1024 * 1024
 
 // shellPtyTermType is the value sent in the SSH ``pty-req`` channel
 // request. ``vt100`` is the broadest-compatible terminal type for
@@ -145,6 +157,18 @@ func (b *captureBuffer) setErr(err error) {
 // cond on ctx.Done(); the main loop then re-checks ctx.Err() under
 // lock and returns. This avoids a busy-wait or a separate timeout
 // loop in every caller.
+//
+// IMPORTANT — pattern-anchoring invariant
+// ----------------------------------------
+// Every regex passed here (the vendor ShellConfig.AnyPrompt entries
+// in prompts.go) MUST be anchored at end-of-string with ``\s*$`` so
+// that ``FindIndex`` returns the prompt at the BUFFER TAIL only —
+// never some prompt-shaped substring earlier in the streamed output.
+// If a future change unanchors a prompt regex, the parser will
+// "see" a prompt mid-output, return early with truncated content,
+// and the next Send will read what's left of the previous command's
+// stdout as if it belonged to its own.
+// Bucket A.2 / MEDIUM#8 from the post-S4 code review.
 func (b *captureBuffer) waitForMatch(ctx context.Context, pattern *regexp.Regexp) (string, error) {
 	// Watcher goroutine that wakes up the cond when ctx is done.
 	// We use a child context so the watcher exits cleanly on match.
@@ -265,6 +289,17 @@ func (c *Client) NewShell(ctx context.Context, cfg ShellConfig) (*Shell, error) 
 	return s, nil
 }
 
+// ErrShellOutputOverflow is the terminal error the reader sets when
+// a single command's output would exceed shellReadBufSize. The
+// previous policy silently dropped the oldest bytes, which was the
+// wrong default for a transport that feeds parsers — a 1.5 MB
+// running-config truncated to the last 512 KiB looks like a valid
+// config to the parser, which is worse than a loud failure. Any Send
+// waiting on the buffer wakes up and returns this error wrapped
+// in a "wait for prompt" message; the caller should Close the shell
+// and retry with a smaller scope.
+var ErrShellOutputOverflow = errors.New("sshclient: shell output exceeded read buffer cap")
+
 // runReader pumps r into the captureBuffer until r returns EOF or an
 // error. Runs in its own goroutine; its termination signals via
 // readerDone and stamps captured.err.
@@ -275,19 +310,24 @@ func (s *Shell) runReader(r io.Reader) {
 	for {
 		n, err := br.Read(chunk)
 		if n > 0 {
-			// Bound the buffer: if it would exceed shellReadBufSize,
-			// drop the oldest bytes. Long-running shells should
-			// never accumulate that much without a Send consuming
-			// it, but we don't want a runaway goroutine to OOM the
-			// agent on a misbehaving device.
+			// Bound the buffer with fail-loudly semantics. If the
+			// post-append size would exceed shellReadBufSize we set
+			// a terminal error rather than silently dropping the
+			// head of the buffer — see Bucket A.2 / HIGH#1. The
+			// reader exits after stamping the error so subsequent
+			// Send calls return promptly instead of hanging on the
+			// cond var until a deadline.
 			total := s.captured.append(chunk[:n])
 			if total > shellReadBufSize {
-				s.captured.mu.Lock()
-				overflow := len(s.captured.buf) - shellReadBufSize
-				if overflow > 0 {
-					s.captured.buf = s.captured.buf[overflow:]
-				}
-				s.captured.mu.Unlock()
+				s.captured.setErr(fmt.Errorf(
+					"%w: %d bytes (cap %d); device output exceeded "+
+						"the per-command bound — close the shell and "+
+						"retry with a narrower command scope",
+					ErrShellOutputOverflow,
+					total,
+					shellReadBufSize,
+				))
+				return
 			}
 		}
 		if err != nil {
