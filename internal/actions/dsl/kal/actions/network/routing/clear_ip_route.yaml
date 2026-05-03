@@ -72,4 +72,4 @@ state_capture:
 
 rollback:
   possible: false
-  rationale: "Routes can't be re-asserted manually — the routing protocol owns the install/withdraw lifecycle. If the post-clear convergence picks an unhealthy path, the right remediation is to fix the routing protocol state (e.g. clear_ospf_neighbor, route-map adjustment), not to undo the clear."
+  rationale: "Routes are owned by the routing protocol. There is no manual re-assert command."

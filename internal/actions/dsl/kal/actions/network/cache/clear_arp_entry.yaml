@@ -76,4 +76,4 @@ state_capture:
 
 rollback:
   possible: false
-  rationale: "ARP entries naturally repopulate on the next forwarding event — there is no 'unclear' command and no value in re-asserting a stale mapping. The natural rollback is the device's own re-resolution."
+  rationale: "ARP entries naturally repopulate on the next forwarding event. Nothing to revert."

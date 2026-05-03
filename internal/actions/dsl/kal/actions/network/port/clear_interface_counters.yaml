@@ -74,4 +74,4 @@ state_capture:
 
 rollback:
   possible: false
-  rationale: "Counters can't be unset to a prior value — there's no 'restore counters' command on either vendor. Once the historical baseline is gone it's gone; the next remediation cycle just builds a fresh observation window."
+  rationale: "Counters cannot be unset to a prior value. The next remediation cycle builds a fresh observation window."
