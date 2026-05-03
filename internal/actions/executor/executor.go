@@ -143,6 +143,40 @@ func (e *Executor) SetResultSink(sink ResultSink) {
 	e.sink = sink
 }
 
+// SubmitRollback queues a rollback command for execution. It bypasses
+// the signed-KAL validator (rollback commands are unsigned — the pre-
+// state's payload_hash is the integrity check) but otherwise mirrors
+// the Submit flow: take a concurrency slot, run in a goroutine, ship
+// the Result through the executor's ResultSink so the dispatcher's
+// PostResult sees it identically to an execute_kal completion.
+//
+// The dispatcher's CommandID for a rollback equals the backend's
+// RollbackAttempt.id — that's what try_record_rollback_result keys
+// on, so the result envelope must carry it through unchanged.
+//
+// Sprint follow-up S2.b.2 ships the dispatch wire path with a stub
+// execution body that reports success and a clear stdout label;
+// real synthesis-from-YAML execution lands in S2.b.2 phase 3.
+func (e *Executor) SubmitRollback(ctx context.Context, cmd RollbackCommand) error {
+	select {
+	case <-e.sem:
+	default:
+		return fmt.Errorf(
+			"executor at capacity (%d concurrent actions)", e.cfg.MaxConcurrent,
+		)
+	}
+
+	go func() {
+		defer func() { e.sem <- struct{}{} }()
+		result := e.executeRollback(ctx, cmd)
+		if sink := e.currentSink(); sink != nil {
+			sink(result)
+		}
+	}()
+
+	return nil
+}
+
 // Submit validates and enqueues an action for execution.
 // Returns an error immediately if the action fails validation or the
 // concurrency limit is exceeded.

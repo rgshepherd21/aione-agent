@@ -56,4 +56,13 @@ const (
 // rather than silently dropping the command.
 const (
 	CommandTypeExecuteKAL = "execute_kal"
+
+	// CommandTypeRollback (Sprint follow-up S2.b.2): the backend's
+	// rollback_service.build_rollback_command emits this when it
+	// queues a rollback after a state_capture validator failure.
+	// Payload shape is documented on rollback_service.py and includes
+	// execution_id, action_id_slug, tenant_id, device_id, pre_state,
+	// payload_hash, captured_at. The agent routes these to its
+	// rollback executor instead of the signed-KAL Submit path.
+	CommandTypeRollback = "rollback"
 )

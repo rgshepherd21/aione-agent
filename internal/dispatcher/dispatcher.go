@@ -57,6 +57,12 @@ const commandResultsPath = "/api/v1/agents/command-results"
 // an interface so tests can inject a fake without a real executor.
 type Submitter interface {
 	Submit(ctx context.Context, a validation.Action) error
+	// SubmitRollback (Sprint follow-up S2.b.2) takes a parsed
+	// rollback command and runs it on a separate executor path
+	// that bypasses signed-KAL validation. Result delivery still
+	// goes through the same ResultSink the regular path uses, so
+	// the dispatcher's PostResult sees it identically.
+	SubmitRollback(ctx context.Context, c executor.RollbackCommand) error
 }
 
 // Poster is the transport surface the dispatcher needs to POST
@@ -120,6 +126,49 @@ func (d *Dispatcher) Deliver(cmds []PendingCommand) []string {
 		if cmd.ExpiresAt != nil && d.now().After(*cmd.ExpiresAt) {
 			d.reportFailure(cmd.CommandID, "command expired before dispatch")
 			acks = append(acks, cmd.CommandID)
+			continue
+		}
+
+		// Sprint follow-up S2.b.2: command_type='rollback' takes a
+		// separate dispatch path because rollback commands are unsigned
+		// (HMAC-signed KAL bodies don't exist for synthesized rollbacks)
+		// and have a different payload shape than execute_kal. The
+		// rollback handler on the executor side bypasses the signed-KAL
+		// allowlist.
+		if cmd.CommandType == CommandTypeRollback {
+			rb, err := buildRollbackCommand(cmd)
+			if err != nil {
+				log.Warn().
+					Err(err).
+					Str("command_id", cmd.CommandID).
+					Msg("dispatcher: rollback translation failed; reporting as failed")
+				d.reportFailure(cmd.CommandID, err.Error())
+				acks = append(acks, cmd.CommandID)
+				continue
+			}
+			if err := d.exec.SubmitRollback(d.ctx, rb); err != nil {
+				if isCapacityError(err) {
+					log.Warn().
+						Err(err).
+						Str("command_id", cmd.CommandID).
+						Msg("dispatcher: executor at capacity; not acking rollback, will retry")
+					continue
+				}
+				log.Warn().
+					Err(err).
+					Str("command_id", cmd.CommandID).
+					Msg("dispatcher: executor rejected rollback; reporting as failed")
+				d.reportFailure(cmd.CommandID, err.Error())
+				acks = append(acks, cmd.CommandID)
+				continue
+			}
+			d.markSeen(cmd.CommandID)
+			acks = append(acks, cmd.CommandID)
+			log.Info().
+				Str("command_id", cmd.CommandID).
+				Str("execution_id", rb.ExecutionID).
+				Str("action_id_slug", rb.ActionIDSlug).
+				Msg("dispatcher: rollback submitted to executor")
 			continue
 		}
 
@@ -234,6 +283,70 @@ func (d *Dispatcher) forget(id string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.seen, id)
+}
+
+// buildRollbackCommand parses a CommandTypeRollback PendingCommand
+// into an executor.RollbackCommand the executor can consume. Shape
+// mirrors the backend's rollback_service.build_rollback_command
+// output.
+//
+// Required fields: execution_id, action_id_slug, tenant_id,
+// pre_state, payload_hash, captured_at. device_id is optional
+// (can be null on the wire when the action targeted the agent host
+// rather than a managed device — uncommon for rollback but possible).
+//
+// Sprint follow-up S2.b.2.
+func buildRollbackCommand(cmd PendingCommand) (executor.RollbackCommand, error) {
+	if cmd.Payload == nil {
+		return executor.RollbackCommand{}, fmt.Errorf("rollback payload is empty")
+	}
+
+	executionID, _ := cmd.Payload["execution_id"].(string)
+	actionSlug, _ := cmd.Payload["action_id_slug"].(string)
+	tenantID, _ := cmd.Payload["tenant_id"].(string)
+	if executionID == "" || actionSlug == "" || tenantID == "" {
+		return executor.RollbackCommand{}, fmt.Errorf(
+			"rollback payload missing one of execution_id / action_id_slug / tenant_id",
+		)
+	}
+	deviceID, _ := cmd.Payload["device_id"].(string) // optional
+
+	preState, _ := cmd.Payload["pre_state"].(map[string]interface{})
+	if preState == nil {
+		return executor.RollbackCommand{}, fmt.Errorf("rollback payload missing pre_state map")
+	}
+
+	payloadHash, _ := cmd.Payload["payload_hash"].(string)
+	if payloadHash == "" {
+		return executor.RollbackCommand{}, fmt.Errorf("rollback payload missing payload_hash")
+	}
+
+	capturedAtStr, _ := cmd.Payload["captured_at"].(string)
+	if capturedAtStr == "" {
+		return executor.RollbackCommand{}, fmt.Errorf("rollback payload missing captured_at")
+	}
+	capturedAt, err := time.Parse(time.RFC3339Nano, capturedAtStr)
+	if err != nil {
+		// Try RFC3339 (no nanoseconds) as a fallback — Python's
+		// .isoformat() omits fractional seconds when they're zero.
+		capturedAt, err = time.Parse(time.RFC3339, capturedAtStr)
+		if err != nil {
+			return executor.RollbackCommand{}, fmt.Errorf(
+				"rollback captured_at %q is not RFC3339: %w", capturedAtStr, err,
+			)
+		}
+	}
+
+	return executor.RollbackCommand{
+		CommandID:    cmd.CommandID,
+		ExecutionID:  executionID,
+		ActionIDSlug: actionSlug,
+		TenantID:     tenantID,
+		DeviceID:     deviceID,
+		PreState:     preState,
+		PayloadHash:  payloadHash,
+		CapturedAt:   capturedAt,
+	}, nil
 }
 
 // buildAction translates a backend AgentCommand into a validator-
