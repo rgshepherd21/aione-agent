@@ -1,0 +1,71 @@
+# KAL action: show_interfaces_status
+# Read-only diagnostic — print the interface status table
+# (interface name, admin/operational state, VLAN, duplex, speed, type)
+# from a Cisco IOS-XE or Arista EOS switch. Tier 1 because it's pure
+# observation: no config writes, no traffic disruption, idempotent
+# on every conceivable axis.
+#
+# Why this action exists
+# ----------------------
+# The autonomous loop's topology and config-snapshot tasks need a
+# canonical "list every interface" surface that's safe to run every
+# poll cycle. ``show interfaces status`` is the universally-supported
+# form (both vendors have it under the same name) — small output,
+# stable across software versions, easy to diff for change detection.
+# The MVP doesn't parse it into structured fields yet; raw stdout is
+# stored on the action_executions row and a future S5.x parser turns
+# it into per-interface device-state rows.
+
+id: show_interfaces_status
+version: 1
+tier: 1
+category: network/diagnostic
+description: "Print the interface status table (port name, admin/operational state, duplex, speed) from a Cisco IOS-XE or Arista EOS device. Read-only; no config writes. Idempotent — safe to run on every topology poll."
+implementation: dsl
+patent_claim_refs: ["4e"]
+
+parameters:
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      # Disable pagination so the persistent shell doesn't hang
+      # waiting on ``--More--`` if the table is long. ``terminal
+      # length 0`` is harmless on a fresh session and idempotent if
+      # repeated.
+      - "terminal length 0"
+    commands:
+      - "show interfaces status"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "show interfaces status"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: none
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "Read-only show command. Nothing to revert."

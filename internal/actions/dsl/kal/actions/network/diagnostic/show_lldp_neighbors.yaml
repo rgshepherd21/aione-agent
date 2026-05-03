@@ -1,0 +1,72 @@
+# KAL action: show_lldp_neighbors
+# Read-only diagnostic — print the LLDP neighbor table for topology
+# discovery. Tier 1: pure observation, no config writes, idempotent.
+#
+# Why this action exists
+# ----------------------
+# The backend's topology_dispatch_tasks beat job proposes this action
+# every minute per device — it has been failing with "unknown action
+# type: show_lldp_neighbors" because the agent didn't have a handler.
+# Adding this YAML closes that gap and unblocks topology discovery
+# (downstream consumer: app/services/topology_parse_service.py).
+#
+# LLDP vs CDP
+# -----------
+# LLDP is the IEEE-standard neighbor discovery protocol; CDP is
+# Cisco-proprietary. Most modern multi-vendor environments run
+# LLDP-only. The topology pipeline can later be extended with a
+# show_cdp_neighbors action for Cisco-only fabrics — deferred to S4.b.
+
+id: show_lldp_neighbors
+version: 1
+tier: 1
+category: network/diagnostic
+description: "Print the LLDP neighbor table from a Cisco IOS-XE or Arista EOS device. Read-only; no config writes. Used by the topology pipeline to map physical adjacency between devices."
+implementation: dsl
+patent_claim_refs: ["4e"]
+
+parameters:
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "terminal length 0"
+    commands:
+      # Bare ``show lldp neighbors`` returns the brief one-line-per-
+      # neighbor table — enough for topology mapping. ``show lldp
+      # neighbors detail`` is the verbose form; we keep this brief
+      # to minimize parse complexity for the v1 pipeline.
+      - "show lldp neighbors"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "show lldp neighbors"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: none
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "Read-only show command. Nothing to revert."
