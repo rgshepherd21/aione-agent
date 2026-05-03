@@ -43,6 +43,7 @@ import (
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/shepherdtech/aione-agent/internal/capture"
 	"github.com/shepherdtech/aione-agent/internal/transport/sshclient"
 )
 
@@ -87,23 +88,56 @@ type DeviceTarget struct {
 
 	// Port is the SSH port. Zero defaults to 22.
 	Port int
+
+	// State-capture identity (Sprint follow-up S2.a). Required when the
+	// action declares a structured ``state_capture`` block; ignored
+	// (left zero-value) when both ``state_capture.pre`` and
+	// ``state_capture.post`` are sentinel strings (``stateless`` /
+	// ``none`` / ``snapshot_*``). The dispatcher populates these from
+	// the agent's persisted registration (AgentID) and the outer
+	// AgentCommand envelope (DeviceID / TenantID).
+
+	// AgentID is the registered agent_registrations.id this agent runs
+	// as. The state_captures row carries it in the agent_id FK.
+	AgentID string
+
+	// TenantID is the tenant the device + execution belong to. The
+	// state_captures row's NOT-NULL tenant_id and the RLS scope both
+	// come from this field.
+	TenantID string
+
+	// DeviceID is the platform-side devices.id row UUID. Optional on
+	// the wire (state_captures.device_id is SET NULL on delete) but
+	// the executor populates it whenever the dispatcher hands one in
+	// — every device-targeted action knows the device id.
+	DeviceID string
 }
 
 // RunDeviceAction is the SSH-transport sibling of Run. Caller provides the
-// loaded action, parameter map, target device, and a credential fetcher.
+// loaded action, parameter map, target device, a credential fetcher, and
+// optionally a CaptureSink for state-capture rows.
 //
 // Returns the same Outcome shape as Run so dispatch layers above can
 // treat shell and device actions uniformly. Non-recoverable validation
 // errors (action doesn't declare SSH, vendor not supported, missing
 // credentials) come back through the error return; per-command failures
 // land in Outcome.Err with an Outcome record.
+//
+// Sink may be nil — the executor uses a no-op sink and the action runs
+// without persisting captures. Production callers (the dispatcher)
+// always supply a real sink wired to capture.Poster; tests inject a
+// recording fake.
 func RunDeviceAction(
 	ctx context.Context,
 	action *KALAction,
 	params map[string]interface{},
 	target DeviceTarget,
 	fetcher CredentialFetcher,
+	sink CaptureSink,
 ) (Outcome, error) {
+	if sink == nil {
+		sink = noopSink{}
+	}
 	startedAt := time.Now().UTC()
 
 	// 1. Parameter schema validation (same as shell path).
@@ -279,6 +313,16 @@ func RunDeviceAction(
 
 	out := Outcome{StartedAt: startedAt, ExecutorUsed: "ssh:" + target.Vendor}
 
+	// Parse the action's state_capture block. Schema-violating shapes
+	// surface here as a synchronous error (they should have been
+	// caught at action-load time, but we belt-and-suspenders against a
+	// loader bypass).
+	captureSpec, err := readStateCaptureSpec(action.Raw, params)
+	if err != nil {
+		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+			fmt.Errorf("dsl: state_capture parse: %w", err)
+	}
+
 	// 7. Open the persistent shell. NewShell requests a PTY, enters
 	// shell mode, and waits for the device's first interactive prompt.
 	// All subsequent commands (pre + user) run inside this shell so
@@ -303,6 +347,14 @@ func RunDeviceAction(
 	// output is aggregated with ``! ===== %s =====`` markers so the
 	// format matches the previous RunSequence shape; downstream
 	// callers parsing stdout don't need to change.
+	//
+	// Note on ordering: pre-commands run BEFORE state_capture.pre.
+	// This is intentional — pre-commands include mode transitions
+	// (``enable``, ``configure terminal``) and the pre-capture
+	// commands typically need to be in a specific mode to run
+	// (e.g. ``do show interface | json`` requires config-mode if
+	// pre-commands left us there). State capture observes the world
+	// the action is about to mutate, after we're in the right mode.
 	for _, pre := range preCommands {
 		if _, err := shell.Send(devCtx, pre); err != nil {
 			out.EndedAt = time.Now().UTC()
@@ -313,6 +365,33 @@ func RunDeviceAction(
 				out.TimedOut = true
 			}
 			return out, nil
+		}
+	}
+
+	// State capture: pre-snapshot. Runs only when the action's YAML
+	// declared a structured ``state_capture.pre`` block. The collector
+	// runs additional commands on the same shell, parses the joined
+	// output, and ships the resulting payload through the sink. A
+	// post-failure of the sink (HTTP error) is logged via the runtime
+	// log but does NOT abort the action — the capture row is
+	// idempotent on the backend so a retry can land it.
+	if captureSpec.Pre.structured() {
+		preCap, capErr := runShellCapture(devCtx, shell, captureSpec.Pre, capture.CaptureTypePre, target)
+		if postErr := sink.Post(devCtx, preCap); postErr != nil {
+			log.Warn().Err(postErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Str("capture_type", capture.CaptureTypePre).
+				Msg("dsl: state-capture pre post failed (continuing action)")
+		}
+		if capErr != nil {
+			// A pre-capture failure doesn't abort the action — we
+			// still have a row on the backend (with succeeded=false)
+			// that signals the validator to be conservative. Log the
+			// error so the operator can see the cause without digging
+			// into the row.
+			log.Warn().Err(capErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Msg("dsl: state-capture pre collector failed")
 		}
 	}
 
@@ -338,6 +417,27 @@ func RunDeviceAction(
 	}
 
 	out.Stdout = combined.String()
+
+	// State capture: post-snapshot. Same shape as pre — runs only
+	// when the YAML's ``state_capture.post`` is structured. Crucially
+	// runs BEFORE we set Success=true, so any S2.b validator can hook
+	// in here (read post against pre, decide rollback) before the
+	// caller's Outcome is finalized.
+	if captureSpec.Post.structured() {
+		postCap, capErr := runShellCapture(devCtx, shell, captureSpec.Post, capture.CaptureTypePost, target)
+		if postErr := sink.Post(devCtx, postCap); postErr != nil {
+			log.Warn().Err(postErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Str("capture_type", capture.CaptureTypePost).
+				Msg("dsl: state-capture post post failed (continuing)")
+		}
+		if capErr != nil {
+			log.Warn().Err(capErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Msg("dsl: state-capture post collector failed")
+		}
+	}
+
 	out.EndedAt = time.Now().UTC()
 
 	// 9. Validator: shell-style exit_code check doesn't apply directly to

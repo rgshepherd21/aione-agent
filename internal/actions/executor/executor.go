@@ -278,11 +278,30 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 				return "", fmt.Errorf("dsl: registry: %w", regErr)
 			}
 			kalAction := reg[action.Type]
+			// agent_id and tenant_id (when registration set them via
+			// SetCaptureContext) are merged in here so SSH-transport
+			// actions with structured state_capture blocks can stamp
+			// state_captures rows with the right identity. Tenant-id
+			// preference order: outer-envelope value (cmd.Payload
+			// "tenant_id") > captureContext fallback. The envelope
+			// value is always correct for the device's tenant, while
+			// captureContext is the agent's own tenant — for the
+			// soak case they're the same, but for future
+			// multi-tenant agents they may differ.
+			ctxAgentID, ctxTenantID, _ := e.captureContextSnapshot()
 			target := dsl.DeviceTarget{
 				ActionExecutionID: action.CommandID,
 				Vendor:            action.DeviceVendor,
 				Host:              action.DeviceHost,
 				Port:              action.DevicePort,
+				AgentID:           ctxAgentID,
+				TenantID: func() string {
+					if action.TenantID != "" {
+						return action.TenantID
+					}
+					return ctxTenantID
+				}(),
+				DeviceID: action.DeviceID,
 			}
 			return e.runDSLAction(ctx, kalAction, action.Params, target)
 		}

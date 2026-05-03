@@ -21,7 +21,39 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/shepherdtech/aione-agent/internal/capture"
 )
+
+// ─── Recording capture sink ──────────────────────────────────────────────
+
+// recordingSink captures every call to Post for later assertions.
+// Used by the S2.a tests that verify pre/post snapshots are emitted
+// in the right order with the right contents.
+type recordingSink struct {
+	calls []captureSinkCall
+}
+
+type captureSinkCall struct {
+	captureType string
+	payload     map[string]any
+	source      string
+	succeeded   bool
+}
+
+func (r *recordingSink) Post(_ context.Context, c capture.Capture) error {
+	src := ""
+	if c.CaptureSource != nil {
+		src = *c.CaptureSource
+	}
+	r.calls = append(r.calls, captureSinkCall{
+		captureType: c.CaptureType,
+		payload:     c.StatePayload,
+		source:      src,
+		succeeded:   c.CaptureSucceeded,
+	})
+	return nil
+}
 
 // ─── Fake credential fetcher ─────────────────────────────────────────────
 
@@ -426,6 +458,7 @@ func TestRunDeviceAction_HappyPath(t *testing.T) {
 			Port:              port,
 		},
 		fetcher,
+		nil, // sink — S2.a state-capture not exercised by this test
 	)
 	if err != nil {
 		t.Fatalf("RunDeviceAction: %v", err)
@@ -460,6 +493,7 @@ func TestRunDeviceAction_RejectsNonSSHTransport(t *testing.T) {
 	_, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe", Host: "10.0.0.1"},
 		&fakeFetcher{},
+		nil, // sink
 	)
 	if err == nil {
 		t.Fatal("expected error for non-ssh transport")
@@ -471,6 +505,7 @@ func TestRunDeviceAction_VendorNotSupported(t *testing.T) {
 	_, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Vendor: "juniper_junos", Host: "10.0.0.1"},
 		&fakeFetcher{},
+		nil, // sink
 	)
 	if err == nil {
 		t.Fatal("expected vendor-not-supported error")
@@ -489,6 +524,7 @@ func TestRunDeviceAction_CredentialFetchFailure(t *testing.T) {
 			ActionExecutionID: "x", Vendor: "cisco_iosxe", Host: "10.0.0.1",
 		},
 		fetcher,
+		nil, // sink — S2.a state-capture not exercised by this test
 	)
 	if err == nil {
 		t.Fatal("expected error when fetcher fails")
@@ -502,7 +538,8 @@ func TestRunDeviceAction_RequiresFetcher(t *testing.T) {
 	action := ciscoShowRunningConfigAction()
 	_, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe", Host: "10.0.0.1"},
-		nil,
+		nil, // fetcher
+		nil, // sink
 	)
 	if err == nil {
 		t.Fatal("expected error when fetcher is nil")
@@ -514,6 +551,7 @@ func TestRunDeviceAction_RequiresActionExecutionID(t *testing.T) {
 	_, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{Vendor: "cisco_iosxe", Host: "10.0.0.1"},
 		&fakeFetcher{cred: DeviceCredential{Type: "ssh_key", Principal: "x", Secret: "k"}},
+		nil, // sink
 	)
 	if err == nil {
 		t.Fatal("expected error when ActionExecutionID is empty")
@@ -525,6 +563,7 @@ func TestRunDeviceAction_RequiresVendor(t *testing.T) {
 	_, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Host: "10.0.0.1"},
 		&fakeFetcher{cred: DeviceCredential{Type: "ssh_key", Principal: "x", Secret: "k"}},
+		nil, // sink
 	)
 	if err == nil {
 		t.Fatal("expected error when Vendor is empty")
@@ -539,6 +578,7 @@ func TestRunDeviceAction_RejectsNonSSHKeyCredential(t *testing.T) {
 	_, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe", Host: "10.0.0.1"},
 		fetcher,
+		nil, // sink — S2.a state-capture not exercised by this test
 	)
 	if err == nil {
 		t.Fatal("expected error for non-ssh_key cred type")
@@ -575,6 +615,7 @@ func TestRunDeviceAction_HostFromCredentialAttrs(t *testing.T) {
 			Vendor:            "cisco_iosxe",
 		},
 		fetcher,
+		nil, // sink — S2.a state-capture not exercised by this test
 	)
 	if err != nil {
 		t.Fatalf("RunDeviceAction: %v", err)
@@ -645,6 +686,7 @@ func TestRunDeviceAction_PasswordAuth_DispatchesViaCredType(t *testing.T) {
 	out, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe"},
 		fetcher,
+		nil, // sink — S2.a state-capture not exercised by this test
 	)
 	if err != nil {
 		t.Fatalf("RunDeviceAction with password auth: %v", err)
@@ -681,11 +723,209 @@ func TestRunDeviceAction_PasswordAlias(t *testing.T) {
 	out, err := RunDeviceAction(context.Background(), action, nil,
 		DeviceTarget{ActionExecutionID: "x", Vendor: "cisco_iosxe"},
 		fetcher,
+		nil, // sink — S2.a state-capture not exercised by this test
 	)
 	if err != nil {
 		t.Fatalf("RunDeviceAction password alias: %v", err)
 	}
 	if !out.Success {
 		t.Fatalf("expected Success: Err=%q", out.Err)
+	}
+}
+
+// ─── Sprint follow-up S2.a: structured state_capture flow ────────────────
+
+// captureCEOSAction is the test-only KAL action used by the S2.a
+// state-capture tests. It wraps a single config-mode toggle around
+// Ethernet1, with a structured ``state_capture`` block that runs
+// ``show interface Ethernet1 | json`` before and after and parses
+// the result through the vendor_eos_interface_status parser. The
+// post phase is meaningfully different from the pre phase so the
+// recordingSink can distinguish them in assertions.
+func captureCEOSAction() *KALAction {
+	raw := map[string]interface{}{
+		"id":             "test_capture_action",
+		"version":        1,
+		"tier":           1,
+		"category":       "network/port",
+		"description":    "S2.a state-capture exerciser",
+		"implementation": "dsl",
+		"idempotent":     true,
+		"transport":      "ssh",
+		"cred_type":      "ssh_key",
+		"validators": map[string]interface{}{
+			"post_execution": map[string]interface{}{
+				"timeout_seconds": 30,
+				"exit_code":       0,
+			},
+		},
+		"state_capture": map[string]interface{}{
+			"pre": map[string]interface{}{
+				"commands": []interface{}{"show interface Ethernet1 | json"},
+				"parser":   "vendor_eos_interface_status",
+			},
+			"post": map[string]interface{}{
+				"commands": []interface{}{"show interface Ethernet1 | json"},
+				"parser":   "vendor_eos_interface_status",
+			},
+		},
+		"rollback": map[string]interface{}{
+			"possible":  false,
+			"rationale": "test fixture",
+		},
+		"parameters": map[string]interface{}{
+			"schema": map[string]interface{}{
+				"type":                 "object",
+				"properties":           map[string]interface{}{},
+				"additionalProperties": false,
+			},
+		},
+		"device_executors": map[string]interface{}{
+			"arista_eos": map[string]interface{}{
+				"pre_commands": []interface{}{"enable", "configure terminal"},
+				"commands":     []interface{}{"interface Ethernet1", "no shutdown", "end"},
+			},
+		},
+	}
+	return &KALAction{ID: "test_capture_action", Raw: raw}
+}
+
+func TestRunDeviceAction_StateCapture_PreAndPostPosted(t *testing.T) {
+	preJSON := `{"interfaces":{"Ethernet1":{"name":"Ethernet1","interfaceStatus":"notconnect","lineProtocolStatus":"down","mtu":9214,"duplex":"duplexFull"}}}`
+	postJSON := `{"interfaces":{"Ethernet1":{"name":"Ethernet1","interfaceStatus":"connected","lineProtocolStatus":"up","mtu":9214,"duplex":"duplexFull"}}}`
+
+	clientPEM, clientPub := newKey(t)
+	srv := startMiniServer(t, "admin", clientPub, map[string]string{
+		"enable":                            "",
+		"configure terminal":                "",
+		"show interface Ethernet1 | json":   preJSON, // mini-server returns same canned for both calls; we re-bind below
+		"interface Ethernet1":               "",
+		"no shutdown":                       "",
+		"end":                               "",
+	})
+	defer srv.Close()
+	host, port := mustHostPort(t, srv.addr())
+
+	// Swap the canned response for the show command after the action
+	// executes. We can't easily wire this through the fake server's
+	// state machine, so we run the action through a custom server
+	// that flips the response after the post-prompt. Simpler path:
+	// allow recordingSink to accept the same payload twice and just
+	// assert ordering + capture_type + capture_source. The validator
+	// service test (backend side) covers content drift.
+	_ = postJSON // silence unused; documents intent
+
+	action := captureCEOSAction()
+	fetcher := &fakeFetcher{
+		cred: DeviceCredential{
+			Type:      "ssh_key",
+			Principal: "admin",
+			Secret:    string(clientPEM),
+			ExpiresAt: time.Now().Add(10 * time.Minute),
+		},
+	}
+	sink := &recordingSink{}
+
+	out, err := RunDeviceAction(context.Background(), action, nil,
+		DeviceTarget{
+			ActionExecutionID: "00000000-0000-0000-0000-aaaaaaaaaaaa",
+			AgentID:           "00000000-0000-0000-0000-bbbbbbbbbbbb",
+			TenantID:          "00000000-0000-0000-0000-cccccccccccc",
+			DeviceID:          "00000000-0000-0000-0000-dddddddddddd",
+			Vendor:            "arista_eos",
+			Host:              host,
+			Port:              port,
+		},
+		fetcher,
+		sink,
+	)
+	if err != nil {
+		t.Fatalf("RunDeviceAction: %v", err)
+	}
+	if !out.Success {
+		t.Fatalf("expected Success: Err=%q AttemptErrs=%v", out.Err, out.AttemptErrs)
+	}
+
+	// Sink should have received exactly two captures: one pre, one
+	// post. The mini-server returns the same canned JSON for both
+	// "show interface Ethernet1 | json" calls — content equality is
+	// not the assertion here; ordering + capture_type is.
+	if len(sink.calls) != 2 {
+		t.Fatalf("expected 2 sink.Post calls, got %d (calls=%+v)",
+			len(sink.calls), sink.calls)
+	}
+	if sink.calls[0].captureType != capture.CaptureTypePre {
+		t.Errorf("first capture: got type=%q want %q",
+			sink.calls[0].captureType, capture.CaptureTypePre)
+	}
+	if sink.calls[1].captureType != capture.CaptureTypePost {
+		t.Errorf("second capture: got type=%q want %q",
+			sink.calls[1].captureType, capture.CaptureTypePost)
+	}
+	if !sink.calls[0].succeeded {
+		t.Errorf("pre capture should be succeeded=true (parser hit canned JSON)")
+	}
+	if !sink.calls[1].succeeded {
+		t.Errorf("post capture should be succeeded=true")
+	}
+	if sink.calls[0].source != "show interface Ethernet1 | json" {
+		t.Errorf("pre capture_source: got %q", sink.calls[0].source)
+	}
+	// Parser output: should at minimum contain interface_name="Ethernet1"
+	// and line_protocol="down" (the canned pre payload).
+	if name, _ := sink.calls[0].payload["interface_name"].(string); name != "Ethernet1" {
+		t.Errorf("pre payload interface_name: got %q want %q", name, "Ethernet1")
+	}
+	if lp, _ := sink.calls[0].payload["line_protocol"].(string); lp != "down" {
+		t.Errorf("pre payload line_protocol: got %q want %q", lp, "down")
+	}
+}
+
+// TestRunDeviceAction_StateCapture_StatelessSkipsCollection verifies the
+// backwards-compatibility path: a YAML declaring ``state_capture: pre:
+// stateless / post: stateless`` (the existing 5 KAL actions' shape)
+// produces zero capture rows. No sink calls — the executor short-circuits
+// when both phases are sentinel strings.
+func TestRunDeviceAction_StateCapture_StatelessSkipsCollection(t *testing.T) {
+	clientPEM, clientPub := newKey(t)
+	srv := startMiniServer(t, "rojadmin", clientPub, map[string]string{
+		"terminal length 0":   "",
+		"show running-config": "Cisco config\n",
+	})
+	defer srv.Close()
+	host, port := mustHostPort(t, srv.addr())
+
+	// ciscoShowRunningConfigAction declares state_capture as the
+	// sentinel strings — the test asserts the executor honors them.
+	action := ciscoShowRunningConfigAction()
+	fetcher := &fakeFetcher{
+		cred: DeviceCredential{
+			Type:      "ssh_key",
+			Principal: "rojadmin",
+			Secret:    string(clientPEM),
+			ExpiresAt: time.Now().Add(10 * time.Minute),
+		},
+	}
+	sink := &recordingSink{}
+
+	out, err := RunDeviceAction(context.Background(), action, nil,
+		DeviceTarget{
+			ActionExecutionID: "11111111-2222-3333-4444-555555555555",
+			Vendor:            "cisco_iosxe",
+			Host:              host,
+			Port:              port,
+		},
+		fetcher,
+		sink,
+	)
+	if err != nil {
+		t.Fatalf("RunDeviceAction: %v", err)
+	}
+	if !out.Success {
+		t.Fatalf("expected Success: %q", out.Err)
+	}
+	if len(sink.calls) != 0 {
+		t.Errorf("expected 0 sink.Post calls for stateless action, got %d: %+v",
+			len(sink.calls), sink.calls)
 	}
 }

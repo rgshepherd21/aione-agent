@@ -309,6 +309,18 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 		devicePort = v
 	}
 
+	// State-capture identity (Sprint follow-up S2.a). Same wire
+	// model as the device-target fields: the backend populates
+	// them on the AgentCommand envelope for any device-targeted
+	// action so the agent can stamp them on the resulting
+	// state_captures rows. Empty for shell actions or for older
+	// platforms that haven't started emitting them — the executor
+	// then falls back to the agent's own AgentID / TenantID for
+	// those scalar fields and skips capture for the device_id
+	// (which has SET NULL ON DELETE on the backend column).
+	deviceID, _ := cmd.Payload["device_id"].(string)
+	tenantID, _ := cmd.Payload["tenant_id"].(string)
+
 	return validation.Action{
 		ID:      id,
 		Type:    typ,
@@ -323,6 +335,8 @@ func buildAction(cmd PendingCommand) (validation.Action, error) {
 		DeviceVendor: deviceVendor,
 		DeviceHost:   deviceHost,
 		DevicePort:   devicePort,
+		DeviceID:     deviceID,
+		TenantID:     tenantID,
 	}, nil
 }
 

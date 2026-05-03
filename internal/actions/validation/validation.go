@@ -57,6 +57,16 @@ type Action struct {
 	DeviceVendor string `json:"-"`
 	DeviceHost   string `json:"-"`
 	DevicePort   int    `json:"-"`
+
+	// State-capture identity (Sprint follow-up S2.a). Same off-wire,
+	// off-signature pattern as the device-target fields: backend
+	// populates these on the outer AgentCommand envelope so the
+	// agent's state-capture pipeline can stamp every state_captures
+	// row with the right device_id + tenant_id. The executor's own
+	// agent_id comes from registration (it doesn't vary per-command,
+	// so it isn't carried on the envelope).
+	DeviceID string `json:"-"`
+	TenantID string `json:"-"`
 }
 
 // ErrNotAllowed is returned when the action type is not in the allowlist.

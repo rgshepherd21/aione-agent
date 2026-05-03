@@ -260,17 +260,72 @@
 
     "state_capture": {
       "type": "object",
-      "description": "Declarative state-capture wrapper. \"none\" = skip. \"stateless\" = no capture needed (action has no observable state). Otherwise, references a snapshot procedure id registered in state_capture_service.py.",
+      "description": "Declarative state-capture wrapper. Each of `pre` and `post` may be either a sentinel string (\"none\" / \"stateless\" / \"snapshot_*\") OR a structured object describing how the agent should collect state on the device. Structured form (Sprint follow-up S2.a) drives the persistent-shell `shellCollector`: the listed commands run in the same shell the action uses, captured output is fed through the named `parser`, and the parser's map is the row's state_payload. `invariants` (optional) is a list of human-readable rules the backend's state_capture_validator_service consults — its DSL is intentionally underspecified here so the validator can evolve without YAML migrations.",
       "required": ["pre", "post"],
       "additionalProperties": false,
       "properties": {
-        "pre": {
-          "type": "string",
-          "pattern": "^(none|stateless|snapshot_[a-z][a-z0-9_]*)$"
+        "pre":  {
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Sentinel form — \"none\" / \"stateless\" / \"snapshot_<id>\". Read-only actions (e.g. show running-config) typically declare \"stateless\" so the executor skips capture for that phase.",
+              "pattern": "^(none|stateless|snapshot_[a-z][a-z0-9_]*)$"
+            },
+            {
+              "type": "object",
+              "description": "Structured form — the persistent-shell collector runs `commands` (in the same shell the action uses) and feeds the joined output through `parser`. The parser is looked up in the agent's `internal/capture/parsers` registry; an unknown name fails the action with a clear error rather than producing an empty payload.",
+              "additionalProperties": false,
+              "required": ["commands", "parser"],
+              "properties": {
+                "commands": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+                },
+                "parser": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              }
+            }
+          ]
         },
         "post": {
-          "type": "string",
-          "pattern": "^(none|stateless|snapshot_[a-z][a-z0-9_]*)$"
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(none|stateless|snapshot_[a-z][a-z0-9_]*)$"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["commands", "parser"],
+              "properties": {
+                "commands": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+                },
+                "parser": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              }
+            }
+          ]
+        },
+        "invariants": {
+          "type": "array",
+          "description": "Optional list of human-readable invariants checked by the backend validator service against the parsed pre+post state_payloads. Free-form for MVP; a structured DSL may replace strings in a future schema version (additive — string form will continue to validate).",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
         }
       }
     },

@@ -65,7 +65,14 @@ device_executors:
       - "interface {{interface_name}}"
       - "shutdown"
       - "no shutdown"
-      - "end"
+      # NOTE (Sprint follow-up S2.a): ``end`` intentionally omitted.
+      # The post state_capture below uses ``do show interfaces ... |
+      # json`` which only works from a config-flavor mode; ``end``
+      # would pop us to privileged-EXEC where ``do`` is rejected as
+      # ``% Invalid input``. The persistent shell's Close() sends a
+      # graceful ``exit`` on session teardown so leaving the device
+      # in (config-if)# is harmless from the next-action perspective
+      # (the next action opens a fresh session anyway).
   # Arista EOS (Sprint F / F3). Identical CLI to IOS-XE — shutdown / no-shutdown toggle works the same.
   arista_eos:
     pre_commands:
@@ -76,7 +83,8 @@ device_executors:
       - "interface {{interface_name}}"
       - "shutdown"
       - "no shutdown"
-      - "end"
+      # See cisco_iosxe note above — ``end`` omitted so post-capture's
+      # ``do show interfaces`` runs from a valid config mode.
 
 validators:
   post_execution:
@@ -84,8 +92,41 @@ validators:
     timeout_seconds: 30
 
 state_capture:
-  pre: stateless
-  post: stateless
+  # Sprint follow-up S2.a: structured state-capture targeting Arista
+  # EOS. Both phases run ``do show interface <name> | json`` in
+  # config mode (we're in config mode after ``configure terminal``
+  # from pre_commands; the ``do`` prefix runs an exec command from
+  # config). The parser ``vendor_eos_interface_status`` flattens
+  # EOS's nested ``interfaces.<name>`` block into the canonical
+  # state_payload shape used by the validator.
+  #
+  # KNOWN LIMITATION: state_capture is action-level in the current
+  # schema, not per-vendor. When this action dispatches to
+  # cisco_iosxe (a device class we don't soak today), IOS-XE will
+  # reject ``| json`` and the parser will emit a capture row with
+  # capture_succeeded=false. The action body still runs to
+  # completion. A schema change to allow
+  # ``device_executors.<vendor>.state_capture`` is queued for the
+  # follow-up after S2.b lands; until then IOS-XE dispatches of
+  # this action are best-effort on the capture side.
+  pre:
+    commands:
+      # Plural ``show interfaces`` form — singular ``show interface``
+      # is rejected as ``% Invalid input`` on cEOS-lab 4.35.4M for at
+      # least some platforms. Confirmed manually on f7-ceos-2:
+      # ``show interfaces ethernet1 | json`` returns the expected
+      # ``{"interfaces": {"Ethernet1": {...}}}`` shape; the parser
+      # ignores command form and only inspects the JSON object.
+      - "do show interfaces {{interface_name}} | json"
+    parser: vendor_eos_interface_status
+  post:
+    commands:
+      - "do show interfaces {{interface_name}} | json"
+    parser: vendor_eos_interface_status
+  invariants:
+    # Free-form for MVP; backend validator (S2.b) interprets.
+    # This says: after the action, the interface's L2 must be up.
+    - "post.line_protocol == 'up' (interface must come back up after toggle)"
 
 rollback:
   possible: false
