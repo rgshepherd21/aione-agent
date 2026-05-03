@@ -47,6 +47,18 @@ cred_type: ssh_key
 device_executors:
   cisco_iosxe:
     pre_commands:
+      # ``enable`` is required as the first step in the persistent-shell
+      # transport (Sprint follow-up S1.b). Cisco IOS-XE and Arista EOS
+      # both land the SSH user in user-EXEC ("ceos1>" / "Router>") mode
+      # by default; ``configure terminal`` is invalid there. Pre-S1.b
+      # the per-command-exec model occasionally landed privileged
+      # depending on the device's vty config and silently masked this,
+      # but the persistent shell preserves whatever mode the user lands
+      # in. cEOS admin and Cisco DevNet sandbox both accept ``enable``
+      # with no additional prompt; if a future device prompts for an
+      # enable password we'll need an enable_secret entry on the
+      # credential bundle.
+      - "enable"
       - "terminal length 0"
       - "configure terminal"
     commands:
@@ -57,6 +69,7 @@ device_executors:
   # Arista EOS (Sprint F / F3). Identical CLI to IOS-XE — shutdown / no-shutdown toggle works the same.
   arista_eos:
     pre_commands:
+      - "enable"
       - "terminal length 0"
       - "configure terminal"
     commands:

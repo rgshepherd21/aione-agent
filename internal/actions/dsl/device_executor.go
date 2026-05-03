@@ -38,6 +38,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -219,11 +220,17 @@ func RunDeviceAction(
 	// Secret into PrivateKeyPEM; ``password``/``ssh_password`` puts it
 	// into Password. Anything else is rejected here with a clear error
 	// rather than letting sshclient surface a less specific one.
+	//
+	// Note: PreCommands is intentionally NOT set on Config. Sprint
+	// follow-up S1.b moved them onto the persistent shell (below) so
+	// they share CLI mode state with the action's commands — a
+	// "configure terminal" pre-command stays in config mode for the
+	// subsequent action commands. The per-command-exec path on Config
+	// can't preserve that state.
 	sshCfg := sshclient.Config{
-		Host:        host,
-		Port:        port,
-		User:        cred.Principal,
-		PreCommands: preCommands,
+		Host: host,
+		Port: port,
+		User: cred.Principal,
 	}
 	switch sshclient.AuthMethod(cred.Type) {
 	case sshclient.AuthMethodPrivateKey:
@@ -237,6 +244,17 @@ func RunDeviceAction(
 			fmt.Errorf("dsl: unsupported credential type %q for SSH transport (expected ssh_key, password, or ssh_password)", cred.Type)
 	}
 
+	// Look up the vendor's prompt registry — the persistent shell needs
+	// AnyPrompt to know when each Send's output is complete. An unknown
+	// vendor here is a configuration error in the platform's device
+	// registration, not a runtime device error, so it returns through
+	// the error channel rather than a populated Outcome.Err.
+	shellCfg, err := sshclient.ShellConfigFor(target.Vendor)
+	if err != nil {
+		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+			fmt.Errorf("dsl: %w", err)
+	}
+
 	// Sprint-I diagnostic: confirm what we built right before Connect.
 	log.Debug().
 		Str("auth_method", string(sshCfg.AuthMethod)).
@@ -246,6 +264,7 @@ func RunDeviceAction(
 		Str("host", sshCfg.Host).
 		Int("port", sshCfg.Port).
 		Str("user", sshCfg.User).
+		Str("vendor", target.Vendor).
 		Msg("dsl: sshclient.Config built; calling Connect")
 
 	cli, err := sshclient.Connect(devCtx, sshCfg)
@@ -260,26 +279,72 @@ func RunDeviceAction(
 
 	out := Outcome{StartedAt: startedAt, ExecutorUsed: "ssh:" + target.Vendor}
 
-	// 7. Run the user's commands.
-	stdout, runErr := cli.RunSequence(devCtx, commands)
-	out.Stdout = stdout
-	out.EndedAt = time.Now().UTC()
-
-	if runErr != nil {
+	// 7. Open the persistent shell. NewShell requests a PTY, enters
+	// shell mode, and waits for the device's first interactive prompt.
+	// All subsequent commands (pre + user) run inside this shell so
+	// CLI mode state persists across them.
+	shell, err := cli.NewShell(devCtx, shellCfg)
+	if err != nil {
+		out.EndedAt = time.Now().UTC()
 		out.ExitCode = -1
-		out.Err = runErr.Error()
-		out.AttemptErrs = append(out.AttemptErrs, runErr.Error())
-		// Distinguish timeout vs. other errors for downstream classification.
+		out.Err = fmt.Sprintf("ssh open shell: %s", err)
+		out.AttemptErrs = append(out.AttemptErrs, out.Err)
 		if errors.Is(devCtx.Err(), context.DeadlineExceeded) {
 			out.TimedOut = true
 		}
 		return out, nil
 	}
+	defer shell.Close()
 
-	// 8. Validator: shell-style exit_code check doesn't apply directly to
+	// 8. Run pre_commands then user commands inside the persistent
+	// shell. Pre-command output is discarded — they're terminal-setup
+	// (``terminal length 0``) or mode transitions (``configure
+	// terminal``) and only their side effects matter. User-command
+	// output is aggregated with ``! ===== %s =====`` markers so the
+	// format matches the previous RunSequence shape; downstream
+	// callers parsing stdout don't need to change.
+	for _, pre := range preCommands {
+		if _, err := shell.Send(devCtx, pre); err != nil {
+			out.EndedAt = time.Now().UTC()
+			out.ExitCode = -1
+			out.Err = fmt.Sprintf("pre-command %q: %s", pre, err)
+			out.AttemptErrs = append(out.AttemptErrs, out.Err)
+			if errors.Is(devCtx.Err(), context.DeadlineExceeded) {
+				out.TimedOut = true
+			}
+			return out, nil
+		}
+	}
+
+	var combined strings.Builder
+	for i, cmd := range commands {
+		if i > 0 {
+			combined.WriteString("\n")
+		}
+		fmt.Fprintf(&combined, "! ===== %s =====\n", cmd)
+		cmdOut, err := shell.Send(devCtx, cmd)
+		if err != nil {
+			out.Stdout = combined.String()
+			out.EndedAt = time.Now().UTC()
+			out.ExitCode = -1
+			out.Err = err.Error()
+			out.AttemptErrs = append(out.AttemptErrs, err.Error())
+			if errors.Is(devCtx.Err(), context.DeadlineExceeded) {
+				out.TimedOut = true
+			}
+			return out, nil
+		}
+		combined.WriteString(cmdOut)
+	}
+
+	out.Stdout = combined.String()
+	out.EndedAt = time.Now().UTC()
+
+	// 9. Validator: shell-style exit_code check doesn't apply directly to
 	// SSH multi-command runs (each command has its own exit). For now,
-	// success = "all commands ran without error." Per-command exit-code
-	// gating is a D3 enhancement.
+	// success = "all commands ran without error." Per-command output
+	// inspection (e.g. ``% Invalid input``) is a future enhancement —
+	// state_capture (S2.a) is the proper place for it.
 	out.ExitCode = 0
 	out.Success = true
 	return out, nil

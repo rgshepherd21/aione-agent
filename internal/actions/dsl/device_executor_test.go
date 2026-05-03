@@ -46,15 +46,35 @@ func (f *fakeFetcher) Fetch(_ context.Context, actionID, credType string) (Devic
 }
 
 // ─── Inline SSH server (self-contained, no cross-package deps) ───────────
+//
+// Sprint follow-up S1.b: this fake server now drives a PTY + shell
+// channel rather than the per-command-exec model from D2/Sprint-I. The
+// dsl device executor opens a persistent shell via sshclient.NewShell,
+// so the test server has to negotiate pty-req + shell-req and stream
+// command echo + canned responses + prompt back over a single channel.
+//
+// The server doesn't model full Cisco/Arista mode transitions
+// (>, #, (config)#) — those are exercised in the sshclient package's
+// shell_test.go. Here we just emit a fixed prompt ("Router> ") which
+// matches every vendor's AnyPrompt regex; the tests only assert that
+// pre_commands and user commands ran and their captured output landed
+// in Outcome.Stdout.
 
 type miniServer struct {
 	listener net.Listener
 	host     ssh.Signer
-	authed   ssh.PublicKey
+	authed   ssh.PublicKey // populated for pubkey servers; nil for password servers
 	user     string
+	password string // populated for password servers; empty for pubkey servers
 	resp     map[string]string
 	wg       sync.WaitGroup
 	closed   chan struct{}
+
+	// hostname is the token used in the prompt. "Router>" matches the
+	// cisco_iosxe AnyPrompt regex \S+(?:\(config[^)]*\)#|>|#) — we
+	// keep the trailing space so callers can distinguish prompt from
+	// command echo on a streaming buffer.
+	hostname string
 }
 
 func startMiniServer(t *testing.T, user string, authed ssh.PublicKey, resp map[string]string) *miniServer {
@@ -78,6 +98,7 @@ func startMiniServer(t *testing.T, user string, authed ssh.PublicKey, resp map[s
 		user:     user,
 		resp:     resp,
 		closed:   make(chan struct{}),
+		hostname: "Router",
 	}
 	go s.loop(t)
 	return s
@@ -110,15 +131,30 @@ func (s *miniServer) loop(t *testing.T) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.handle(t, c)
+			s.handleConn(t, c)
 		}()
 	}
 }
 
-func (s *miniServer) handle(_ *testing.T, c net.Conn) {
+// handleConn negotiates SSH auth and dispatches accepted session
+// channels to handleSession. Auth method is selected by which field
+// is populated: ``password`` ⇒ password callback; otherwise pubkey.
+func (s *miniServer) handleConn(t *testing.T, c net.Conn) {
 	defer c.Close()
-	cfg := &ssh.ServerConfig{
-		PublicKeyCallback: func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+	cfg := &ssh.ServerConfig{}
+	if s.password != "" {
+		pw := s.password
+		cfg.PasswordCallback = func(meta ssh.ConnMetadata, attempt []byte) (*ssh.Permissions, error) {
+			if meta.User() != s.user {
+				return nil, fmt.Errorf("unknown user %q", meta.User())
+			}
+			if string(attempt) != pw {
+				return nil, errors.New("password mismatch")
+			}
+			return &ssh.Permissions{}, nil
+		}
+	} else {
+		cfg.PublicKeyCallback = func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if meta.User() != s.user {
 				return nil, fmt.Errorf("unknown user %q", meta.User())
 			}
@@ -126,7 +162,7 @@ func (s *miniServer) handle(_ *testing.T, c net.Conn) {
 				return nil, errors.New("public key mismatch")
 			}
 			return &ssh.Permissions{}, nil
-		},
+		}
 	}
 	cfg.AddHostKey(s.host)
 	conn, chans, reqs, err := ssh.NewServerConn(c, cfg)
@@ -144,46 +180,128 @@ func (s *miniServer) handle(_ *testing.T, c net.Conn) {
 		if err != nil {
 			continue
 		}
-		go func(ch ssh.Channel, reqs <-chan *ssh.Request) {
-			defer ch.Close()
-			for r := range reqs {
-				if r.Type != "exec" {
-					if r.WantReply {
-						_ = r.Reply(false, nil)
-					}
-					continue
+		go s.handleSession(t, ch, chReqs)
+	}
+}
+
+// handleSession negotiates pty-req + shell-req, then runs a tiny
+// read-loop: each line received from the client is echoed, the
+// command is looked up in s.resp, the canned response is written, and
+// a fresh prompt is emitted. ``exit`` (the polite shutdown that
+// sshclient.Shell.Close sends) terminates the loop.
+func (s *miniServer) handleSession(_ *testing.T, ch ssh.Channel, reqs <-chan *ssh.Request) {
+	defer ch.Close()
+
+	gotPty := false
+	gotShell := false
+	for !gotShell {
+		req, ok := <-reqs
+		if !ok {
+			return
+		}
+		switch req.Type {
+		case "pty-req":
+			gotPty = true
+			if req.WantReply {
+				_ = req.Reply(true, nil)
+			}
+		case "shell":
+			if !gotPty {
+				if req.WantReply {
+					_ = req.Reply(false, nil)
 				}
-				cmd := readExec(r.Payload)
-				if r.WantReply {
-					_ = r.Reply(true, nil)
-				}
-				out, ok := s.resp[cmd]
-				if !ok {
-					_, _ = ch.Stderr().Write([]byte("unknown: " + cmd + "\n"))
-					_, _ = ch.SendRequest("exit-status", false, exitBytes(1))
-					return
-				}
-				_, _ = io.WriteString(ch, out)
-				_, _ = ch.SendRequest("exit-status", false, exitBytes(0))
 				return
 			}
-		}(ch, chReqs)
+			gotShell = true
+			if req.WantReply {
+				_ = req.Reply(true, nil)
+			}
+		default:
+			if req.WantReply {
+				_ = req.Reply(false, nil)
+			}
+		}
+	}
+	go ssh.DiscardRequests(reqs)
+
+	prompt := s.hostname + "> "
+
+	// Initial prompt — sshclient.NewShell waits for this before
+	// returning. Without it the new-shell call would time out.
+	if _, err := io.WriteString(ch, prompt); err != nil {
+		return
+	}
+
+	br := newLineReader(ch)
+	for {
+		line, err := br.ReadLine()
+		if err != nil {
+			return
+		}
+		cmd := strings.TrimRight(line, "\r\n")
+		// Echo the command — many real PTYs do this regardless of
+		// ECHO mode, and sshclient.cleanShellOutput strips it.
+		if _, werr := io.WriteString(ch, cmd+"\r\n"); werr != nil {
+			return
+		}
+		// ``exit`` is the graceful shutdown sshclient.Shell.Close sends.
+		if cmd == "exit" {
+			return
+		}
+		if out, ok := s.resp[cmd]; ok {
+			if out != "" {
+				if _, werr := io.WriteString(ch, out); werr != nil {
+					return
+				}
+				if !strings.HasSuffix(out, "\n") && !strings.HasSuffix(out, "\r\n") {
+					_, _ = io.WriteString(ch, "\r\n")
+				}
+			}
+		} else {
+			// Unknown command: emit a Cisco-shaped error string so
+			// the captured stdout is informative if a test fails.
+			_, _ = io.WriteString(ch, "% Invalid input detected at '^' marker.\r\n")
+		}
+		// Issue prompt for next command.
+		if _, werr := io.WriteString(ch, prompt); werr != nil {
+			return
+		}
 	}
 }
 
-func readExec(p []byte) string {
-	if len(p) < 4 {
-		return ""
-	}
-	n := int(p[0])<<24 | int(p[1])<<16 | int(p[2])<<8 | int(p[3])
-	if 4+n > len(p) {
-		return ""
-	}
-	return string(p[4 : 4+n])
+// lineReader returns content up to and including a newline. We avoid
+// bufio to sidestep buffering subtleties on the SSH channel (the
+// peer's writes may not align with bufio's read-ahead boundaries).
+type lineReader struct {
+	r   io.Reader
+	buf []byte
 }
 
-func exitBytes(code uint32) []byte {
-	return []byte{byte(code >> 24), byte(code >> 16), byte(code >> 8), byte(code)}
+func newLineReader(r io.Reader) *lineReader { return &lineReader{r: r} }
+
+func (lr *lineReader) ReadLine() (string, error) {
+	tmp := make([]byte, 1)
+	for {
+		for i, b := range lr.buf {
+			if b == '\n' {
+				line := string(lr.buf[:i+1])
+				lr.buf = lr.buf[i+1:]
+				return line, nil
+			}
+		}
+		n, err := lr.r.Read(tmp)
+		if n > 0 {
+			lr.buf = append(lr.buf, tmp[:n]...)
+		}
+		if err != nil {
+			if len(lr.buf) > 0 {
+				line := string(lr.buf)
+				lr.buf = nil
+				return line, nil
+			}
+			return "", err
+		}
+	}
 }
 
 func newKey(t *testing.T) ([]byte, ssh.PublicKey) {
@@ -470,7 +588,9 @@ func TestRunDeviceAction_HostFromCredentialAttrs(t *testing.T) {
 
 // startPasswordMiniServer is a sibling of startMiniServer that
 // authenticates via PasswordCallback. Mirrors the IOS-XE / DevNet
-// sandbox auth model.
+// sandbox auth model. Both helpers share the same underlying
+// miniServer.handleConn path — auth method is selected by which of
+// (authed, password) the constructor populated.
 func startPasswordMiniServer(t *testing.T, user, password string, resp map[string]string) *miniServer {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -489,86 +609,13 @@ func startPasswordMiniServer(t *testing.T, user, password string, resp map[strin
 		listener: ln,
 		host:     hostSigner,
 		user:     user,
+		password: password,
 		resp:     resp,
 		closed:   make(chan struct{}),
+		hostname: "Router",
 	}
-	go s.loopPassword(t, password)
+	go s.loop(t)
 	return s
-}
-
-func (s *miniServer) loopPassword(t *testing.T, password string) {
-	for {
-		c, err := s.listener.Accept()
-		if err != nil {
-			select {
-			case <-s.closed:
-				return
-			default:
-				return
-			}
-		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.handlePassword(t, c, password)
-		}()
-	}
-}
-
-func (s *miniServer) handlePassword(_ *testing.T, c net.Conn, password string) {
-	defer c.Close()
-	cfg := &ssh.ServerConfig{
-		PasswordCallback: func(meta ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
-			if meta.User() != s.user {
-				return nil, fmt.Errorf("unknown user %q", meta.User())
-			}
-			if string(pw) != password {
-				return nil, errors.New("password mismatch")
-			}
-			return &ssh.Permissions{}, nil
-		},
-	}
-	cfg.AddHostKey(s.host)
-	conn, chans, reqs, err := ssh.NewServerConn(c, cfg)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	go ssh.DiscardRequests(reqs)
-	for newCh := range chans {
-		if newCh.ChannelType() != "session" {
-			_ = newCh.Reject(ssh.UnknownChannelType, "")
-			continue
-		}
-		ch, chReqs, err := newCh.Accept()
-		if err != nil {
-			continue
-		}
-		go func(ch ssh.Channel, reqs <-chan *ssh.Request) {
-			defer ch.Close()
-			for r := range reqs {
-				if r.Type != "exec" {
-					if r.WantReply {
-						_ = r.Reply(false, nil)
-					}
-					continue
-				}
-				cmd := readExec(r.Payload)
-				if r.WantReply {
-					_ = r.Reply(true, nil)
-				}
-				out, ok := s.resp[cmd]
-				if !ok {
-					_, _ = ch.Stderr().Write([]byte("unknown: " + cmd + "\n"))
-					_, _ = ch.SendRequest("exit-status", false, exitBytes(1))
-					return
-				}
-				_, _ = io.WriteString(ch, out)
-				_, _ = ch.SendRequest("exit-status", false, exitBytes(0))
-				return
-			}
-		}(ch, chReqs)
-	}
 }
 
 // TestRunDeviceAction_PasswordAuth_DispatchesViaCredType verifies the
