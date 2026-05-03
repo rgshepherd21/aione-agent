@@ -1,0 +1,74 @@
+# KAL action: show_running_config
+# Read-only diagnostic — dump the device's full running config. Tier 1
+# because it's pure observation: no config writes, no traffic
+# disruption. The output is the canonical input to the config-snapshot
+# pipeline (app/services/config_snapshot_ingest_service.py), which
+# diffs successive runs to detect drift.
+#
+# Why this action exists
+# ----------------------
+# The backend's config_snapshot_dispatch_tasks beat job already
+# proposes this action every ~5 minutes per device — it has been
+# failing with "unknown action type: show_running_config" because the
+# agent didn't have a handler. Adding this YAML closes the gap and
+# unblocks config-drift detection.
+
+id: show_running_config
+version: 1
+tier: 1
+category: network/diagnostic
+description: "Dump the full running configuration from a Cisco IOS-XE or Arista EOS device. Read-only; no config writes. Used by the config-snapshot pipeline to detect configuration drift between successive snapshots."
+implementation: dsl
+patent_claim_refs: ["4e"]
+
+parameters:
+  schema:
+    type: object
+    properties: {}
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      # ``show running-config`` is a privileged-EXEC command; the
+      # persistent shell starts in user-EXEC ``>`` mode by default,
+      # so ``enable`` first to elevate.
+      - "enable"
+      # Disable pagination — running-config can be hundreds of
+      # lines on a populated device and ``--More--`` would hang
+      # the persistent shell.
+      - "terminal length 0"
+    commands:
+      - "show running-config"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "show running-config"
+
+validators:
+  post_execution:
+    exit_code: 0
+    # Larger budget than show_interfaces_status — running-config can
+    # be tens of KB on a populated device and the persistent shell
+    # collects line-by-line.
+    timeout_seconds: 60
+
+state_capture:
+  pre: none
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "Read-only show command. Nothing to revert."
