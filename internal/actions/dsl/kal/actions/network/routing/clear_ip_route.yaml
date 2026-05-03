@@ -1,0 +1,75 @@
+# KAL action: clear_ip_route
+# Force re-installation of a specific IP route in the device's RIB
+# by removing it; the routing process re-adds it on the next
+# protocol update or convergence cycle. Tier 2 — the brief gap
+# between clear and re-install means traffic to the prefix
+# black-holes for tens of milliseconds (or longer if the routing
+# protocol is slow to readvertise), which is acceptable in most
+# scenarios but operator approval keeps human eyes on the call.
+#
+# Common alert → remediation pattern
+# ----------------------------------
+# Stale route persists after a topology change — e.g. the
+# upstream peer recovered but the local RIB still shows the
+# alternate path. ``clear ip route <prefix>`` evicts the stale
+# entry; the active routing protocol (BGP/OSPF/static + tracker)
+# re-installs whichever path it now prefers, picking up the
+# recovered link.
+
+id: clear_ip_route
+version: 1
+tier: 2
+category: network/routing
+description: "Remove a specific IP route from the device's RIB so the active routing protocol re-installs it on next convergence. Used to recover from a stale RIB entry after upstream topology changes. Tier 2 — brief traffic black-hole window during reconvergence; operator approval gates production use."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [prefix]
+    properties:
+      prefix:
+        type: string
+        description: "CIDR prefix to clear from the RIB (e.g. '10.1.0.0/16'). Must be the exact prefix as installed; the command is not LPM-aware."
+        pattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$"
+        minLength: 9
+        maxLength: 18
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear ip route {{prefix}}"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear ip route {{prefix}}"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "Routes can't be re-asserted manually — the routing protocol owns the install/withdraw lifecycle. If the post-clear convergence picks an unhealthy path, the right remediation is to fix the routing protocol state (e.g. clear_ospf_neighbor, route-map adjustment), not to undo the clear."

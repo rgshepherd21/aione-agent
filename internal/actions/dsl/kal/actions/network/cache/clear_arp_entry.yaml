@@ -1,0 +1,79 @@
+# KAL action: clear_arp_entry
+# Flush a specific ARP cache entry on a Cisco IOS-XE or Arista EOS
+# device. Tier 2 — modifies the device's L3 forwarding plane (one
+# IP→MAC mapping) and forces re-resolution on the next packet.
+#
+# Why Tier 2 (not Tier 1)
+# -----------------------
+# The action is recoverable in the sense that ARP repopulates on
+# next forwarding event, but during the gap a stale-mapping mis-
+# behavior could be replaced by a different transient (incomplete
+# resolution, gratuitous ARP race, etc.). Operator approval is the
+# right gate until we have telemetry good enough to pre-validate
+# that the entry IS stale.
+#
+# Common alert → remediation pattern
+# ----------------------------------
+# Reachability alarm fires on host X; show arp shows X mapped to a
+# MAC that no longer matches the host's new chassis (e.g. failover
+# happened and ARP didn't refresh). ``clear arp-cache <ip>`` forces
+# the device to re-resolve, restoring connectivity.
+
+id: clear_arp_entry
+version: 1
+tier: 2
+category: network/cache
+description: "Clear a specific ARP cache entry on a Cisco IOS-XE or Arista EOS device, forcing the device to re-resolve the IP→MAC mapping on next forwarding event. Tier 2 — modifies L3 forwarding state; operator approval required until stale-mapping detection telemetry can pre-validate."
+implementation: dsl
+patent_claim_refs: ["4f", "4g"]
+
+parameters:
+  schema:
+    type: object
+    required: [target_ip]
+    properties:
+      target_ip:
+        type: string
+        description: "IPv4 address whose ARP entry should be cleared (e.g. '10.1.2.3')."
+        pattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}$"
+        minLength: 7
+        maxLength: 15
+    additionalProperties: false
+
+idempotent: true
+
+supported_platforms:
+  - { os: linux,   archs: [amd64, arm64] }
+  - { os: darwin,  archs: [amd64, arm64] }
+  - { os: windows, archs: [amd64, arm64] }
+
+transport: ssh
+cred_type: ssh_key
+
+device_executors:
+  cisco_iosxe:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      - "clear arp-cache {{target_ip}}"
+  arista_eos:
+    pre_commands:
+      - "enable"
+      - "terminal length 0"
+    commands:
+      # EOS uses ``clear arp <ip>``, not ``clear arp-cache``.
+      - "clear arp {{target_ip}}"
+
+validators:
+  post_execution:
+    exit_code: 0
+    timeout_seconds: 30
+
+state_capture:
+  pre: stateless
+  post: stateless
+
+rollback:
+  possible: false
+  rationale: "ARP entries naturally repopulate on the next forwarding event — there is no 'unclear' command and no value in re-asserting a stale mapping. The natural rollback is the device's own re-resolution."
