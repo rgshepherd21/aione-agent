@@ -85,6 +85,14 @@ type Executor struct {
 	// a binary rebuild. Wired up in service.go alongside exec.New.
 	dslClient *dsl.RegistryClient
 
+	// vaultBackend (optional) is the agent-side credential vault used
+	// to resolve ``local://`` credential refs without going through the
+	// platform's /v1/credentials/issue endpoint. Sprint S3.b. When nil,
+	// any ``local://`` ref falls through to credFetcher and 404s on
+	// the issuer side (the V1.local invariant — backend MUST NOT
+	// resolve local://).
+	vaultBackend dsl.VaultBackend
+
 	// credFetcher (optional) is the credential fetcher used by SSH /
 	// NETCONF / SNMP / cloud_api transport actions to obtain short-
 	// lived per-action credentials from the platform. Sprint D / Task
@@ -103,6 +111,16 @@ type Executor struct {
 // to call any time before the first action dispatch.
 func (e *Executor) SetDSLClient(c *dsl.RegistryClient) {
 	e.dslClient = c
+}
+
+// SetVaultBackend installs the agent-side credential vault used to
+// resolve ``local://`` credential refs. Sprint S3.b. Safe to call at
+// most once during startup before any Submit calls race the setter.
+// Passing nil leaves the vault disabled — local:// refs then fall
+// through to the platform fetcher, which 404s by design (the
+// V1.local invariant).
+func (e *Executor) SetVaultBackend(b dsl.VaultBackend) {
+	e.vaultBackend = b
 }
 
 // SetCredentialFetcher attaches the per-action credential fetcher used
@@ -141,6 +159,40 @@ func (e *Executor) SetResultSink(sink ResultSink) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.sink = sink
+}
+
+// SubmitRollback queues a rollback command for execution. It bypasses
+// the signed-KAL validator (rollback commands are unsigned — the pre-
+// state's payload_hash is the integrity check) but otherwise mirrors
+// the Submit flow: take a concurrency slot, run in a goroutine, ship
+// the Result through the executor's ResultSink so the dispatcher's
+// PostResult sees it identically to an execute_kal completion.
+//
+// The dispatcher's CommandID for a rollback equals the backend's
+// RollbackAttempt.id — that's what try_record_rollback_result keys
+// on, so the result envelope must carry it through unchanged.
+//
+// Sprint follow-up S2.b.2 ships the dispatch wire path with a stub
+// execution body that reports success and a clear stdout label;
+// real synthesis-from-YAML execution lands in S2.b.2 phase 3.
+func (e *Executor) SubmitRollback(ctx context.Context, cmd RollbackCommand) error {
+	select {
+	case <-e.sem:
+	default:
+		return fmt.Errorf(
+			"executor at capacity (%d concurrent actions)", e.cfg.MaxConcurrent,
+		)
+	}
+
+	go func() {
+		defer func() { e.sem <- struct{}{} }()
+		result := e.executeRollback(ctx, cmd)
+		if sink := e.currentSink(); sink != nil {
+			sink(result)
+		}
+	}()
+
+	return nil
 }
 
 // Submit validates and enqueues an action for execution.
@@ -278,11 +330,39 @@ func (e *Executor) dispatch(ctx context.Context, action validation.Action) (stri
 				return "", fmt.Errorf("dsl: registry: %w", regErr)
 			}
 			kalAction := reg[action.Type]
+			// agent_id and tenant_id (when registration set them via
+			// SetCaptureContext) are merged in here so SSH-transport
+			// actions with structured state_capture blocks can stamp
+			// state_captures rows with the right identity. Tenant-id
+			// preference order: outer-envelope value (cmd.Payload
+			// "tenant_id") > captureContext fallback. The envelope
+			// value is always correct for the device's tenant, while
+			// captureContext is the agent's own tenant — for the
+			// soak case they're the same, but for future
+			// multi-tenant agents they may differ.
+			ctxAgentID, ctxTenantID, _ := e.captureContextSnapshot()
 			target := dsl.DeviceTarget{
 				ActionExecutionID: action.CommandID,
 				Vendor:            action.DeviceVendor,
 				Host:              action.DeviceHost,
 				Port:              action.DevicePort,
+				AgentID:           ctxAgentID,
+				TenantID: func() string {
+					if action.TenantID != "" {
+						return action.TenantID
+					}
+					return ctxTenantID
+				}(),
+				DeviceID: action.DeviceID,
+				// Sprint S3.b: when CredentialRef begins with
+				// ``local://``, RunDeviceAction routes through
+				// LocalVault instead of the platform fetcher. Empty
+				// CredentialRef + non-nil LocalVault is fine — the
+				// vault just isn't consulted. Nil LocalVault + a
+				// local:// ref is the operator-error case
+				// RunDeviceAction surfaces with a clear message.
+				CredentialRef: action.CredentialRef,
+				LocalVault:    e.vaultBackend,
 			}
 			return e.runDSLAction(ctx, kalAction, action.Params, target)
 		}

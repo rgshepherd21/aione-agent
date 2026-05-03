@@ -19,9 +19,11 @@ import (
 // --- fakes ---------------------------------------------------------
 
 type fakeSubmitter struct {
-	mu       sync.Mutex
-	submits  []validation.Action
-	submitFn func(validation.Action) error // optional override
+	mu               sync.Mutex
+	submits          []validation.Action
+	submitFn         func(validation.Action) error // optional override
+	rollbackSubmits  []executor.RollbackCommand
+	rollbackSubmitFn func(executor.RollbackCommand) error // optional override
 }
 
 func (f *fakeSubmitter) Submit(_ context.Context, a validation.Action) error {
@@ -34,6 +36,16 @@ func (f *fakeSubmitter) Submit(_ context.Context, a validation.Action) error {
 	return nil
 }
 
+func (f *fakeSubmitter) SubmitRollback(_ context.Context, c executor.RollbackCommand) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rollbackSubmits = append(f.rollbackSubmits, c)
+	if f.rollbackSubmitFn != nil {
+		return f.rollbackSubmitFn(c)
+	}
+	return nil
+}
+
 func (f *fakeSubmitter) lastSubmitted() (validation.Action, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -41,6 +53,15 @@ func (f *fakeSubmitter) lastSubmitted() (validation.Action, bool) {
 		return validation.Action{}, false
 	}
 	return f.submits[len(f.submits)-1], true
+}
+
+func (f *fakeSubmitter) lastRollbackSubmitted() (executor.RollbackCommand, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.rollbackSubmits) == 0 {
+		return executor.RollbackCommand{}, false
+	}
+	return f.rollbackSubmits[len(f.rollbackSubmits)-1], true
 }
 
 type fakePoster struct {
@@ -131,6 +152,95 @@ func TestDeliver_HappyPath(t *testing.T) {
 	}
 	if got.Sig != "deadbeef" {
 		t.Errorf("sig not carried through: %q", got.Sig)
+	}
+}
+
+// rollbackCommand builds a CommandTypeRollback PendingCommand
+// with the wire shape rollback_service.build_rollback_command emits.
+// Sprint follow-up S2.b.2.
+func rollbackCommand(commandID, executionID, actionSlug string) PendingCommand {
+	return PendingCommand{
+		CommandID:   commandID,
+		CommandType: CommandTypeRollback,
+		Payload: map[string]interface{}{
+			"execution_id":   executionID,
+			"action_id_slug": actionSlug,
+			"tenant_id":      "00000000-0000-0000-0000-cccccccccccc",
+			"device_id":      "00000000-0000-0000-0000-dddddddddddd",
+			"pre_state":      map[string]interface{}{"line_protocol": "up"},
+			"payload_hash":   "0000000000000000000000000000000000000000000000000000000000000000",
+			"captured_at":    "2026-05-03T01:00:00Z",
+		},
+		Priority: 10,
+	}
+}
+
+func TestDeliver_RollbackRoutesToSubmitRollback(t *testing.T) {
+	sub := &fakeSubmitter{}
+	post := &fakePoster{}
+	d := newTestDispatcher(t, sub, post)
+
+	cmd := rollbackCommand("rb-cmd-1", "exec-uuid-1", "interface_shutdown_no_shutdown")
+
+	acks := d.Deliver([]PendingCommand{cmd})
+
+	if len(acks) != 1 || acks[0] != "rb-cmd-1" {
+		t.Fatalf("expected acks=[rb-cmd-1], got %v", acks)
+	}
+	if len(sub.submits) != 0 {
+		t.Errorf("rollback should NOT have hit Submit, got %d execute_kal submits", len(sub.submits))
+	}
+	got, ok := sub.lastRollbackSubmitted()
+	if !ok {
+		t.Fatalf("SubmitRollback was never called")
+	}
+	if got.CommandID != "rb-cmd-1" {
+		t.Errorf("CommandID: got %q want rb-cmd-1", got.CommandID)
+	}
+	if got.ExecutionID != "exec-uuid-1" {
+		t.Errorf("ExecutionID: got %q want exec-uuid-1", got.ExecutionID)
+	}
+	if got.ActionIDSlug != "interface_shutdown_no_shutdown" {
+		t.Errorf("ActionIDSlug: got %q", got.ActionIDSlug)
+	}
+	if got.PreState["line_protocol"] != "up" {
+		t.Errorf("PreState not carried through: %+v", got.PreState)
+	}
+}
+
+func TestDeliver_RollbackMissingFieldFailsCleanly(t *testing.T) {
+	sub := &fakeSubmitter{}
+	post := &fakePoster{}
+	d := newTestDispatcher(t, sub, post)
+
+	// Malformed payload — execution_id missing.
+	cmd := PendingCommand{
+		CommandID:   "rb-bad-1",
+		CommandType: CommandTypeRollback,
+		Payload: map[string]interface{}{
+			"action_id_slug": "x",
+			"tenant_id":      "y",
+			"pre_state":      map[string]interface{}{},
+			"payload_hash":   strings.Repeat("0", 64),
+			"captured_at":    "2026-05-03T01:00:00Z",
+		},
+		Priority: 10,
+	}
+
+	acks := d.Deliver([]PendingCommand{cmd})
+
+	if len(acks) != 1 || acks[0] != "rb-bad-1" {
+		t.Fatalf("expected acks=[rb-bad-1], got %v", acks)
+	}
+	if len(sub.rollbackSubmits) != 0 {
+		t.Errorf("malformed rollback should not have hit SubmitRollback")
+	}
+	posts := post.snapshot()
+	if len(posts) != 1 {
+		t.Fatalf("expected 1 failure result POST, got %d", len(posts))
+	}
+	if posts[0].body.Status != StatusFailed {
+		t.Errorf("expected failed status, got %q", posts[0].body.Status)
 	}
 }
 

@@ -111,7 +111,15 @@ func (e *Executor) runDSLAction(
 		// CommandID. The backend's /v1/credentials/issue handler
 		// expects this to match an ActionExecution row in the running
 		// state — which is exactly what command_id is.
-		outcome, err = dsl.RunDeviceAction(ctx, action, p, target, e.credFetcher)
+		// Pass the same poster ``flush_dns_cache`` uses so SSH-transport
+		// actions ship pre/post state_captures rows through the same
+		// path. ``e.capturePoster`` is type ``capture.Sink``;
+		// ``dsl.CaptureSink`` is an alias for the same interface,
+		// so the value passes through unmodified. Nil-poster path
+		// (no SetCaptureContext call yet) leaves RunDeviceAction in
+		// noop-sink mode.
+		_, _, sink := e.captureContextSnapshot()
+		outcome, err = dsl.RunDeviceAction(ctx, action, p, target, e.credFetcher, sink)
 	}
 
 	if err != nil {

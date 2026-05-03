@@ -38,12 +38,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/shepherdtech/aione-agent/internal/capture"
+	"github.com/shepherdtech/aione-agent/internal/credentials/vault"
 	"github.com/shepherdtech/aione-agent/internal/transport/sshclient"
 )
+
+// VaultBackend is the narrow interface RunDeviceAction uses to
+// resolve ``local://`` credential refs without going through the
+// platform fetcher. ``*vault.Backend`` satisfies it; production
+// callers wire the configured backend via Executor.SetVaultBackend.
+// Sprint S3.b.
+type VaultBackend = vault.Backend
+
+// localSchemePrefix is the URI prefix RunDeviceAction inspects to
+// route credential resolution. Anything starting with this prefix
+// goes to the local vault; everything else goes to the platform
+// fetcher. Defined here (not imported from a constant elsewhere)
+// because the agent owns the agent-side semantics of this string.
+const localSchemePrefix = "local://"
 
 // CredentialFetcher is the contract the device executor uses to obtain
 // short-lived per-action credentials. Implemented by
@@ -86,23 +103,74 @@ type DeviceTarget struct {
 
 	// Port is the SSH port. Zero defaults to 22.
 	Port int
+
+	// State-capture identity (Sprint follow-up S2.a). Required when the
+	// action declares a structured ``state_capture`` block; ignored
+	// (left zero-value) when both ``state_capture.pre`` and
+	// ``state_capture.post`` are sentinel strings (``stateless`` /
+	// ``none`` / ``snapshot_*``). The dispatcher populates these from
+	// the agent's persisted registration (AgentID) and the outer
+	// AgentCommand envelope (DeviceID / TenantID).
+
+	// AgentID is the registered agent_registrations.id this agent runs
+	// as. The state_captures row carries it in the agent_id FK.
+	AgentID string
+
+	// TenantID is the tenant the device + execution belong to. The
+	// state_captures row's NOT-NULL tenant_id and the RLS scope both
+	// come from this field.
+	TenantID string
+
+	// DeviceID is the platform-side devices.id row UUID. Optional on
+	// the wire (state_captures.device_id is SET NULL on delete) but
+	// the executor populates it whenever the dispatcher hands one in
+	// — every device-targeted action knows the device id.
+	DeviceID string
+
+	// CredentialRef is the device's vault locator (Sprint S3.b). When
+	// it begins with ``local://``, RunDeviceAction resolves the
+	// remainder of the URI through LocalVault without calling the
+	// platform fetcher — the V1.local invariant says backend code
+	// MUST NOT resolve local:// refs. For any other prefix
+	// (``dev://``, ``azure-kv://``, ``keyvault://``), the platform
+	// fetcher resolves and the agent never sees the raw ref. Empty
+	// when the platform didn't carry one through (older agent /
+	// older backend deploy) — the agent then falls through to the
+	// platform fetcher unconditionally.
+	CredentialRef string
+
+	// LocalVault (Sprint S3.b) is the agent-side credential vault
+	// used to resolve ``local://`` refs. Optional; nil leaves
+	// local:// resolution disabled (any local:// ref then falls
+	// through to the platform fetcher and 404s by design).
+	LocalVault VaultBackend
 }
 
 // RunDeviceAction is the SSH-transport sibling of Run. Caller provides the
-// loaded action, parameter map, target device, and a credential fetcher.
+// loaded action, parameter map, target device, a credential fetcher, and
+// optionally a CaptureSink for state-capture rows.
 //
 // Returns the same Outcome shape as Run so dispatch layers above can
 // treat shell and device actions uniformly. Non-recoverable validation
 // errors (action doesn't declare SSH, vendor not supported, missing
 // credentials) come back through the error return; per-command failures
 // land in Outcome.Err with an Outcome record.
+//
+// Sink may be nil — the executor uses a no-op sink and the action runs
+// without persisting captures. Production callers (the dispatcher)
+// always supply a real sink wired to capture.Poster; tests inject a
+// recording fake.
 func RunDeviceAction(
 	ctx context.Context,
 	action *KALAction,
 	params map[string]interface{},
 	target DeviceTarget,
 	fetcher CredentialFetcher,
+	sink CaptureSink,
 ) (Outcome, error) {
+	if sink == nil {
+		sink = noopSink{}
+	}
 	startedAt := time.Now().UTC()
 
 	// 1. Parameter schema validation (same as shell path).
@@ -158,39 +226,89 @@ func RunDeviceAction(
 			fmt.Errorf("dsl: action %q vendor %q has no command(s)", action.ID, target.Vendor)
 	}
 
-	// 5. Fetch credentials.
-	if fetcher == nil {
-		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
-			errors.New("dsl: CredentialFetcher is required")
-	}
+	// 5. Resolve credentials. Sprint S3.b: when the device's
+	// credential_ref is a ``local://`` URI, route through the agent's
+	// own vault.Backend (target.LocalVault); otherwise fall through
+	// to the platform's per-action credential issuer
+	// (CredentialFetcher.Fetch). The split-plane invariant says the
+	// platform MUST NOT resolve local:// — see the V1.local
+	// architectural enforcement at
+	// aione-backend/tests/test_local_scheme_invariant.py.
 	if target.ActionExecutionID == "" {
 		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
 			errors.New("dsl: DeviceTarget.ActionExecutionID is required")
 	}
-	// Pass the action's pinned ``cred_type`` (from KAL YAML) as a hint —
-	// the platform now derives the actual auth method from the device row
-	// (Sprint I / migration 031) and may return a different type. We
-	// dispatch on the response's Type below, not on this hint.
 	hintedCredType, _ := action.Raw["cred_type"].(string)
-	cred, err := fetcher.Fetch(ctx, target.ActionExecutionID, hintedCredType)
-	if err != nil {
-		return Outcome{
-			StartedAt: startedAt,
-			EndedAt:   time.Now().UTC(),
-			Err:       fmt.Sprintf("credential fetch: %s", err),
-		}, fmt.Errorf("dsl: credential fetch: %w", err)
-	}
+	var cred DeviceCredential
+	if strings.HasPrefix(target.CredentialRef, localSchemePrefix) {
+		// Local resolution path. The vault MUST be wired, otherwise
+		// the action fails fast with a clear message rather than
+		// silently leaking a local:// ref to the platform fetcher.
+		if target.LocalVault == nil {
+			return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+				fmt.Errorf(
+					"dsl: action requires local vault for credential_ref=%q "+
+						"but no vault is wired (set vault.backend in agent.yaml)",
+					target.CredentialRef,
+				)
+		}
+		id := strings.TrimPrefix(target.CredentialRef, localSchemePrefix)
+		vc, err := target.LocalVault.Get(ctx, id)
+		if err != nil {
+			return Outcome{
+				StartedAt: startedAt,
+				EndedAt:   time.Now().UTC(),
+				Err:       fmt.Sprintf("local credential lookup: %s", err),
+			}, fmt.Errorf("dsl: local vault lookup: %w", err)
+		}
+		// Vault.Credentials → DeviceCredential. Schemas overlap
+		// 1:1 today, so the conversion is a field copy. ExpiresAt
+		// stays zero for vault-resolved creds — local creds don't
+		// have a per-action TTL the way platform-issued creds do.
+		cred = DeviceCredential{
+			Type:      vc.Type,
+			Principal: vc.Principal,
+			Secret:    vc.Secret,
+			Attrs:     vc.Attrs,
+		}
+		log.Debug().
+			Str("action_id", target.ActionExecutionID).
+			Str("credential_ref", target.CredentialRef).
+			Str("cred_type_received", cred.Type).
+			Str("cred_principal", cred.Principal).
+			Int("cred_secret_len", len(cred.Secret)).
+			Msg("dsl: credential bundle resolved from local vault")
+	} else {
+		// Platform fetch path — the historical default.
+		if fetcher == nil {
+			return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+				errors.New("dsl: CredentialFetcher is required")
+		}
+		// Pass the action's pinned ``cred_type`` (from KAL YAML) as a hint —
+		// the platform now derives the actual auth method from the device row
+		// (Sprint I / migration 031) and may return a different type. We
+		// dispatch on the response's Type below, not on this hint.
+		fetched, err := fetcher.Fetch(ctx, target.ActionExecutionID, hintedCredType)
+		if err != nil {
+			return Outcome{
+				StartedAt: startedAt,
+				EndedAt:   time.Now().UTC(),
+				Err:       fmt.Sprintf("credential fetch: %s", err),
+			}, fmt.Errorf("dsl: credential fetch: %w", err)
+		}
+		cred = fetched
 
-	// Sprint-I diagnostic: log what the platform actually handed back.
-	// Helps debug cases where the agent's hint and the device's
-	// configured auth method disagree (drift) and the SSH handshake
-	// fails with an opaque "attempted methods [none]" error.
-	log.Debug().
-		Str("action_id", target.ActionExecutionID).
-		Str("cred_type_received", cred.Type).
-		Str("cred_principal", cred.Principal).
-		Int("cred_secret_len", len(cred.Secret)).
-		Msg("dsl: credential bundle received from platform")
+		// Sprint-I diagnostic: log what the platform actually handed back.
+		// Helps debug cases where the agent's hint and the device's
+		// configured auth method disagree (drift) and the SSH handshake
+		// fails with an opaque "attempted methods [none]" error.
+		log.Debug().
+			Str("action_id", target.ActionExecutionID).
+			Str("cred_type_received", cred.Type).
+			Str("cred_principal", cred.Principal).
+			Int("cred_secret_len", len(cred.Secret)).
+			Msg("dsl: credential bundle received from platform")
+	}
 
 	// Resolve host: caller-provided target.Host wins; fall back to
 	// cred.Attrs["host"] which the vault may also carry. Same for port.
@@ -219,11 +337,17 @@ func RunDeviceAction(
 	// Secret into PrivateKeyPEM; ``password``/``ssh_password`` puts it
 	// into Password. Anything else is rejected here with a clear error
 	// rather than letting sshclient surface a less specific one.
+	//
+	// Note: PreCommands is intentionally NOT set on Config. Sprint
+	// follow-up S1.b moved them onto the persistent shell (below) so
+	// they share CLI mode state with the action's commands — a
+	// "configure terminal" pre-command stays in config mode for the
+	// subsequent action commands. The per-command-exec path on Config
+	// can't preserve that state.
 	sshCfg := sshclient.Config{
-		Host:        host,
-		Port:        port,
-		User:        cred.Principal,
-		PreCommands: preCommands,
+		Host: host,
+		Port: port,
+		User: cred.Principal,
 	}
 	switch sshclient.AuthMethod(cred.Type) {
 	case sshclient.AuthMethodPrivateKey:
@@ -237,6 +361,17 @@ func RunDeviceAction(
 			fmt.Errorf("dsl: unsupported credential type %q for SSH transport (expected ssh_key, password, or ssh_password)", cred.Type)
 	}
 
+	// Look up the vendor's prompt registry — the persistent shell needs
+	// AnyPrompt to know when each Send's output is complete. An unknown
+	// vendor here is a configuration error in the platform's device
+	// registration, not a runtime device error, so it returns through
+	// the error channel rather than a populated Outcome.Err.
+	shellCfg, err := sshclient.ShellConfigFor(target.Vendor)
+	if err != nil {
+		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+			fmt.Errorf("dsl: %w", err)
+	}
+
 	// Sprint-I diagnostic: confirm what we built right before Connect.
 	log.Debug().
 		Str("auth_method", string(sshCfg.AuthMethod)).
@@ -246,6 +381,7 @@ func RunDeviceAction(
 		Str("host", sshCfg.Host).
 		Int("port", sshCfg.Port).
 		Str("user", sshCfg.User).
+		Str("vendor", target.Vendor).
 		Msg("dsl: sshclient.Config built; calling Connect")
 
 	cli, err := sshclient.Connect(devCtx, sshCfg)
@@ -260,26 +396,138 @@ func RunDeviceAction(
 
 	out := Outcome{StartedAt: startedAt, ExecutorUsed: "ssh:" + target.Vendor}
 
-	// 7. Run the user's commands.
-	stdout, runErr := cli.RunSequence(devCtx, commands)
-	out.Stdout = stdout
-	out.EndedAt = time.Now().UTC()
+	// Parse the action's state_capture block. Schema-violating shapes
+	// surface here as a synchronous error (they should have been
+	// caught at action-load time, but we belt-and-suspenders against a
+	// loader bypass).
+	captureSpec, err := readStateCaptureSpec(action.Raw, params)
+	if err != nil {
+		return Outcome{StartedAt: startedAt, EndedAt: time.Now().UTC()},
+			fmt.Errorf("dsl: state_capture parse: %w", err)
+	}
 
-	if runErr != nil {
+	// 7. Open the persistent shell. NewShell requests a PTY, enters
+	// shell mode, and waits for the device's first interactive prompt.
+	// All subsequent commands (pre + user) run inside this shell so
+	// CLI mode state persists across them.
+	shell, err := cli.NewShell(devCtx, shellCfg)
+	if err != nil {
+		out.EndedAt = time.Now().UTC()
 		out.ExitCode = -1
-		out.Err = runErr.Error()
-		out.AttemptErrs = append(out.AttemptErrs, runErr.Error())
-		// Distinguish timeout vs. other errors for downstream classification.
+		out.Err = fmt.Sprintf("ssh open shell: %s", err)
+		out.AttemptErrs = append(out.AttemptErrs, out.Err)
 		if errors.Is(devCtx.Err(), context.DeadlineExceeded) {
 			out.TimedOut = true
 		}
 		return out, nil
 	}
+	defer shell.Close()
 
-	// 8. Validator: shell-style exit_code check doesn't apply directly to
+	// 8. Run pre_commands then user commands inside the persistent
+	// shell. Pre-command output is discarded — they're terminal-setup
+	// (``terminal length 0``) or mode transitions (``configure
+	// terminal``) and only their side effects matter. User-command
+	// output is aggregated with ``! ===== %s =====`` markers so the
+	// format matches the previous RunSequence shape; downstream
+	// callers parsing stdout don't need to change.
+	//
+	// Note on ordering: pre-commands run BEFORE state_capture.pre.
+	// This is intentional — pre-commands include mode transitions
+	// (``enable``, ``configure terminal``) and the pre-capture
+	// commands typically need to be in a specific mode to run
+	// (e.g. ``do show interface | json`` requires config-mode if
+	// pre-commands left us there). State capture observes the world
+	// the action is about to mutate, after we're in the right mode.
+	for _, pre := range preCommands {
+		if _, err := shell.Send(devCtx, pre); err != nil {
+			out.EndedAt = time.Now().UTC()
+			out.ExitCode = -1
+			out.Err = fmt.Sprintf("pre-command %q: %s", pre, err)
+			out.AttemptErrs = append(out.AttemptErrs, out.Err)
+			if errors.Is(devCtx.Err(), context.DeadlineExceeded) {
+				out.TimedOut = true
+			}
+			return out, nil
+		}
+	}
+
+	// State capture: pre-snapshot. Runs only when the action's YAML
+	// declared a structured ``state_capture.pre`` block. The collector
+	// runs additional commands on the same shell, parses the joined
+	// output, and ships the resulting payload through the sink. A
+	// post-failure of the sink (HTTP error) is logged via the runtime
+	// log but does NOT abort the action — the capture row is
+	// idempotent on the backend so a retry can land it.
+	if captureSpec.Pre.structured() {
+		preCap, capErr := runShellCapture(devCtx, shell, captureSpec.Pre, capture.CaptureTypePre, target)
+		if postErr := sink.Post(devCtx, preCap); postErr != nil {
+			log.Warn().Err(postErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Str("capture_type", capture.CaptureTypePre).
+				Msg("dsl: state-capture pre post failed (continuing action)")
+		}
+		if capErr != nil {
+			// A pre-capture failure doesn't abort the action — we
+			// still have a row on the backend (with succeeded=false)
+			// that signals the validator to be conservative. Log the
+			// error so the operator can see the cause without digging
+			// into the row.
+			log.Warn().Err(capErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Msg("dsl: state-capture pre collector failed")
+		}
+	}
+
+	var combined strings.Builder
+	for i, cmd := range commands {
+		if i > 0 {
+			combined.WriteString("\n")
+		}
+		fmt.Fprintf(&combined, "! ===== %s =====\n", cmd)
+		cmdOut, err := shell.Send(devCtx, cmd)
+		if err != nil {
+			out.Stdout = combined.String()
+			out.EndedAt = time.Now().UTC()
+			out.ExitCode = -1
+			out.Err = err.Error()
+			out.AttemptErrs = append(out.AttemptErrs, err.Error())
+			if errors.Is(devCtx.Err(), context.DeadlineExceeded) {
+				out.TimedOut = true
+			}
+			return out, nil
+		}
+		combined.WriteString(cmdOut)
+	}
+
+	out.Stdout = combined.String()
+
+	// State capture: post-snapshot. Same shape as pre — runs only
+	// when the YAML's ``state_capture.post`` is structured. Crucially
+	// runs BEFORE we set Success=true, so any S2.b validator can hook
+	// in here (read post against pre, decide rollback) before the
+	// caller's Outcome is finalized.
+	if captureSpec.Post.structured() {
+		postCap, capErr := runShellCapture(devCtx, shell, captureSpec.Post, capture.CaptureTypePost, target)
+		if postErr := sink.Post(devCtx, postCap); postErr != nil {
+			log.Warn().Err(postErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Str("capture_type", capture.CaptureTypePost).
+				Msg("dsl: state-capture post post failed (continuing)")
+		}
+		if capErr != nil {
+			log.Warn().Err(capErr).
+				Str("action_execution_id", target.ActionExecutionID).
+				Msg("dsl: state-capture post collector failed")
+		}
+	}
+
+	out.EndedAt = time.Now().UTC()
+
+	// 9. Validator: shell-style exit_code check doesn't apply directly to
 	// SSH multi-command runs (each command has its own exit). For now,
-	// success = "all commands ran without error." Per-command exit-code
-	// gating is a D3 enhancement.
+	// success = "all commands ran without error." Per-command output
+	// inspection (e.g. ``% Invalid input``) is a future enhancement —
+	// state_capture (S2.a) is the proper place for it.
 	out.ExitCode = 0
 	out.Success = true
 	return out, nil

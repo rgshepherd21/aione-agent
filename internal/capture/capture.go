@@ -107,10 +107,12 @@ func (r Request) validate() error {
 	if r.CaptureMethod == "" {
 		return fmt.Errorf("CaptureMethod is required")
 	}
-	if r.CaptureType != CaptureTypePre && r.CaptureType != CaptureTypePost {
+	switch r.CaptureType {
+	case CaptureTypePre, CaptureTypePost, CaptureTypeRollbackPost:
+	default:
 		return fmt.Errorf(
-			"CaptureType must be %q or %q, got %q",
-			CaptureTypePre, CaptureTypePost, r.CaptureType,
+			"CaptureType must be %q, %q, or %q; got %q",
+			CaptureTypePre, CaptureTypePost, CaptureTypeRollbackPost, r.CaptureType,
 		)
 	}
 	return nil

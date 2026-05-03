@@ -44,6 +44,11 @@ cred_type: ssh_key
 device_executors:
   cisco_iosxe:
     pre_commands:
+      # ``enable`` first — Sprint S1.b persistent-shell transport lands
+      # the SSH user in user-EXEC ``>`` mode by default. ``clear
+      # errdisable interface`` is a privileged-EXEC command and would
+      # otherwise return ``% Invalid input``.
+      - "enable"
       - "terminal length 0"
     commands:
       - "clear errdisable interface {{interface_name}}"
@@ -56,6 +61,7 @@ device_executors:
   # natural-rollback behavior as the Cisco branch's rationale below.
   arista_eos:
     pre_commands:
+      - "enable"
       - "terminal length 0"
       - "configure terminal"
     commands:

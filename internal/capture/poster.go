@@ -13,6 +13,16 @@ type HTTPPoster interface {
 	PostJSON(ctx context.Context, path string, body, dst interface{}) error
 }
 
+// Sink is the narrow interface action executors use to ship a built
+// Capture to the backend. ``*Poster`` satisfies it; tests inject
+// recording fakes. Defined in this package so both
+// ``internal/actions/executor`` (the flush_dns_cache bracket path)
+// and ``internal/actions/dsl`` (the SSH-transport state-capture path)
+// can refer to the same type without duplicating the interface.
+type Sink interface {
+	Post(ctx context.Context, c Capture) error
+}
+
 // Poster ships Capture values to the backend's state_captures endpoint.
 // Thin shim so callers don't hard-code the path and future header or
 // auth tweaks land in exactly one spot.

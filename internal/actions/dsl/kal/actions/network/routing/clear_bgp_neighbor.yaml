@@ -47,6 +47,11 @@ cred_type: ssh_key
 device_executors:
   cisco_iosxe:
     pre_commands:
+      # ``enable`` first — Sprint S1.b persistent-shell transport lands
+      # the user in user-EXEC ``>`` mode. ``clear ip bgp <neighbor>`` is
+      # a privileged-EXEC command and would otherwise return
+      # ``% Invalid input``.
+      - "enable"
       - "terminal length 0"
     commands:
       - "clear ip bgp {{neighbor_ip}}"

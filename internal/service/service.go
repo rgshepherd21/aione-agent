@@ -20,6 +20,7 @@ import (
 	"github.com/shepherdtech/aione-agent/internal/capture"
 	"github.com/shepherdtech/aione-agent/internal/config"
 	"github.com/shepherdtech/aione-agent/internal/credentials"
+	"github.com/shepherdtech/aione-agent/internal/credentials/vault"
 	"github.com/shepherdtech/aione-agent/internal/dispatcher"
 	"github.com/shepherdtech/aione-agent/internal/heartbeat"
 	"github.com/shepherdtech/aione-agent/internal/registration"
@@ -281,6 +282,34 @@ func (a *Agent) run(ctx context.Context) error {
 	credManager.StartPurger(ctx, 5*time.Minute)
 	exec.SetCredentialFetcher(executor.NewCredentialFetcher(credManager))
 
+	// --- Local credential vault (Sprint S3.b) ----------------------------
+	// Resolves ``local://`` credential references locally instead of
+	// going through the platform's /v1/credentials/issue endpoint. The
+	// platform never resolves local:// (V1.local invariant — see
+	// aione-backend/tests/test_local_scheme_invariant.py); the agent
+	// owns those refs end-to-end via this vault.
+	//
+	// Backend selection comes from cfg.Vault.Backend:
+	//   "dev"      → in-memory map seeded from DevSeedJSON or
+	//                DevSeedPath. The default — safe for first-run
+	//                agents that don't yet handle local:// refs.
+	//   "azure-kv" → Azure Key Vault via DefaultAzureCredential.
+	//
+	// Config errors fail the process at startup rather than producing
+	// silent ErrNotFound at request time. A nil vault is a valid
+	// state (no SetVaultBackend call) — RunDeviceAction falls through
+	// to the platform fetcher for every credential request.
+	vaultBackend, vaultErr := buildVaultBackend(cfg.Vault)
+	if vaultErr != nil {
+		log.Fatal().Err(vaultErr).Msg("vault backend init failed")
+	}
+	if vaultBackend != nil {
+		exec.SetVaultBackend(vaultBackend)
+		log.Info().
+			Str("backend", cfg.Vault.Backend).
+			Msg("local credential vault wired")
+	}
+
 	// --- State-capture poster --------------------------------------------
 	// Wire the capture-bracket path into the executor. With this wired,
 	// flush_dns_cache (and any future bracketed action) ships pre/post
@@ -424,6 +453,56 @@ func (a *Agent) handleWSMessage(ctx context.Context, msg transport.WSMessage, ex
 		return fmt.Errorf("parsing action payload: %w", err)
 	}
 	return exec.Submit(ctx, action)
+}
+
+// buildVaultBackend selects and constructs the agent's local
+// credential vault from VaultConfig. Returns ``(nil, nil)`` when no
+// vault is configured — the agent still runs, just can't resolve
+// ``local://`` refs (callers fall through to the platform fetcher).
+//
+// Sprint S3.b. Selection rules:
+//
+//   * Backend == "" or "dev"  → DevBackend, seeded from DevSeedJSON
+//                                (priority) or DevSeedPath (fallback).
+//                                Empty seeds yield an empty in-memory
+//                                map.
+//   * Backend == "azure-kv"   → AzureKVBackend pointed at AzureURL.
+//                                Errors if AzureURL is empty.
+//   * Backend == "none"       → returns (nil, nil) explicitly.
+//   * Anything else           → error so a typo in the YAML fails
+//                                the process at startup rather than
+//                                producing silent mis-routing.
+func buildVaultBackend(cfg config.VaultConfig) (vault.Backend, error) {
+	switch cfg.Backend {
+	case "", "dev":
+		if cfg.DevSeedJSON != "" {
+			b, err := vault.NewDevBackendFromJSON(cfg.DevSeedJSON)
+			if err != nil {
+				return nil, fmt.Errorf("vault dev seed (json): %w", err)
+			}
+			return b, nil
+		}
+		if cfg.DevSeedPath != "" {
+			b, err := vault.NewDevBackendFromFile(cfg.DevSeedPath)
+			if err != nil {
+				return nil, fmt.Errorf("vault dev seed (file): %w", err)
+			}
+			return b, nil
+		}
+		return vault.NewDevBackend(), nil
+	case "azure-kv":
+		if cfg.AzureURL == "" {
+			return nil, fmt.Errorf("vault.backend=azure-kv but vault.azure_url is empty")
+		}
+		return vault.NewAzureKVBackend(cfg.AzureURL)
+	case "none":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf(
+			"unknown vault.backend %q (expected dev / azure-kv / none)",
+			cfg.Backend,
+		)
+	}
 }
 
 // wsURL converts the HTTP base URL to a WebSocket URL.

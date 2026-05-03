@@ -12,12 +12,12 @@ import (
 )
 
 // CapturePoster is the transport surface the executor needs to ship a
-// state capture to the backend. Kept as a small interface so tests can
-// inject a recording fake without a real HTTPS client. Production
-// implementation lives in internal/capture/poster.go.
-type CapturePoster interface {
-	Post(ctx context.Context, c capture.Capture) error
-}
+// state capture to the backend. Aliases ``capture.Sink`` so the SSH-
+// transport state-capture path (internal/actions/dsl) and this
+// shell-bracket path share the same type. Tests can inject a recording
+// fake that satisfies ``capture.Sink``; production wires the
+// ``*capture.Poster`` from internal/capture/poster.go.
+type CapturePoster = capture.Sink
 
 // SetCaptureContext installs the agent/tenant identity and capture
 // poster used by action brackets. Safe to call at most once during

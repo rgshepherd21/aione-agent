@@ -47,33 +47,138 @@ cred_type: ssh_key
 device_executors:
   cisco_iosxe:
     pre_commands:
+      # ``enable`` is required as the first step in the persistent-shell
+      # transport (Sprint follow-up S1.b). Cisco IOS-XE and Arista EOS
+      # both land the SSH user in user-EXEC ("ceos1>" / "Router>") mode
+      # by default; ``configure terminal`` is invalid there. Pre-S1.b
+      # the per-command-exec model occasionally landed privileged
+      # depending on the device's vty config and silently masked this,
+      # but the persistent shell preserves whatever mode the user lands
+      # in. cEOS admin and Cisco DevNet sandbox both accept ``enable``
+      # with no additional prompt; if a future device prompts for an
+      # enable password we'll need an enable_secret entry on the
+      # credential bundle.
+      - "enable"
       - "terminal length 0"
       - "configure terminal"
     commands:
       - "interface {{interface_name}}"
       - "shutdown"
       - "no shutdown"
-      - "end"
+      # NOTE (Sprint follow-up S2.a): ``end`` intentionally omitted.
+      # The post state_capture below uses ``do show interfaces ... |
+      # json`` which only works from a config-flavor mode; ``end``
+      # would pop us to privileged-EXEC where ``do`` is rejected as
+      # ``% Invalid input``. The persistent shell's Close() sends a
+      # graceful ``exit`` on session teardown so leaving the device
+      # in (config-if)# is harmless from the next-action perspective
+      # (the next action opens a fresh session anyway).
   # Arista EOS (Sprint F / F3). Identical CLI to IOS-XE — shutdown / no-shutdown toggle works the same.
   arista_eos:
     pre_commands:
+      - "enable"
       - "terminal length 0"
       - "configure terminal"
     commands:
       - "interface {{interface_name}}"
       - "shutdown"
       - "no shutdown"
-      - "end"
+      # See cisco_iosxe note above — ``end`` omitted so post-capture's
+      # ``do show interfaces`` runs from a valid config mode.
 
 validators:
   post_execution:
     exit_code: 0
-    timeout_seconds: 30
+    # Bumped from 30s to 60s in S2.b.2 phase 2c. The rollback path
+    # uses the same budget and runs more work than the original
+    # action (fresh SSH dial + 5 synthesis commands + post-capture's
+    # shell.Send). Empirically, ``no shutdown`` on cEOS-lab can
+    # hold the persistent-shell prompt for 5-15s while the link
+    # reconverges, which was eating the original 30s envelope and
+    # starving the rollback_post capture's shell.Send.
+    timeout_seconds: 60
 
 state_capture:
-  pre: stateless
-  post: stateless
+  # Sprint follow-up S2.a: structured state-capture targeting Arista
+  # EOS. Both phases run ``do show interface <name> | json`` in
+  # config mode (we're in config mode after ``configure terminal``
+  # from pre_commands; the ``do`` prefix runs an exec command from
+  # config). The parser ``vendor_eos_interface_status`` flattens
+  # EOS's nested ``interfaces.<name>`` block into the canonical
+  # state_payload shape used by the validator.
+  #
+  # KNOWN LIMITATION: state_capture is action-level in the current
+  # schema, not per-vendor. When this action dispatches to
+  # cisco_iosxe (a device class we don't soak today), IOS-XE will
+  # reject ``| json`` and the parser will emit a capture row with
+  # capture_succeeded=false. The action body still runs to
+  # completion. A schema change to allow
+  # ``device_executors.<vendor>.state_capture`` is queued for the
+  # follow-up after S2.b lands; until then IOS-XE dispatches of
+  # this action are best-effort on the capture side.
+  pre:
+    commands:
+      # Plural ``show interfaces`` form — singular ``show interface``
+      # is rejected as ``% Invalid input`` on cEOS-lab 4.35.4M for at
+      # least some platforms. Confirmed manually on f7-ceos-2:
+      # ``show interfaces ethernet1 | json`` returns the expected
+      # ``{"interfaces": {"Ethernet1": {...}}}`` shape; the parser
+      # ignores command form and only inspects the JSON object.
+      - "do show interfaces {{interface_name}} | json"
+    parser: vendor_eos_interface_status
+  post:
+    commands:
+      - "do show interfaces {{interface_name}} | json"
+    parser: vendor_eos_interface_status
+  invariants:
+    # Free-form for MVP; backend validator (S2.b) interprets.
+    # This says: after the action, the interface's L2 must be up.
+    - "post.line_protocol == 'up' (interface must come back up after toggle)"
 
 rollback:
-  possible: false
-  rationale: "Idempotent toggle — final state matches initial state on a healthy interface. If the post-check sees the interface still down, that's a hardware/cable problem the toggle can't fix; operator escalation is the right path, not a rollback."
+  # Sprint follow-up S2.b.2 phase 2c: rollback flipped from
+  # ``possible: false`` to ``possible: true`` with a synthesis
+  # that re-cycles the interface. Rationale shifted: instead of
+  # treating the toggle as a no-op (the prior "idempotent toggle"
+  # justification), we now treat any post-action state divergence
+  # from pre as worth a recovery attempt. The synthesis is
+  # functionally identical to the action — re-toggle — but lives
+  # under ``rollback.spec`` so the auto-trigger pipeline has a
+  # concrete commands list to execute when invariants fail.
+  #
+  # This is the canonical S2.b.2 demo target: with auto-trigger
+  # wired (validator → rollback_service.initiate_rollback →
+  # agent's RunRollback), an invariant mismatch on a real cEOS
+  # dispatch fires this synthesis end-to-end. Production tenants
+  # may want a tighter rollback spec (e.g. write the description
+  # back from ``pre_state``) for non-idempotent actions; we model
+  # that with the upcoming ``set_interface_description`` action.
+  possible: true
+  rationale: "Re-toggle the interface to drive it back to its captured pre-state when validator invariants fail. Idempotent on healthy hardware; on truly stuck interfaces the rollback's own post-check escalates to the operator."
+  spec:
+    device_executors:
+      # Synthesis commands reference the captured pre_state via the
+      # ``pre_state.<key>`` interpolation form (S2.b.2 phase 2b
+      # extension to interpolationRE). The rollback command payload
+      # does NOT yet carry the original action's params (deferred to
+      # a later wire-format extension) — only pre_state — so the
+      # synthesis MUST reach for ``pre_state.interface_name`` rather
+      # than ``interface_name``. The vendor_eos_interface_status
+      # parser already includes interface_name in its canonical
+      # state_payload, so this lookup is well-defined.
+      arista_eos:
+        pre_commands:
+          - "enable"
+          - "configure terminal"
+        commands:
+          - "interface {{pre_state.interface_name}}"
+          - "shutdown"
+          - "no shutdown"
+      cisco_iosxe:
+        pre_commands:
+          - "enable"
+          - "configure terminal"
+        commands:
+          - "interface {{pre_state.interface_name}}"
+          - "shutdown"
+          - "no shutdown"

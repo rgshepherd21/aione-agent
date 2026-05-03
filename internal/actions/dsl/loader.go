@@ -38,10 +38,20 @@ var shellBlocklist = map[string]struct{}{
 	"wsl.exe": {}, "wsl": {},
 }
 
-// interpolationRE matches a `{{name}}` token in an executor arg. Greedy
-// match — `{{a}}stuff{{b}}` is two tokens. Mirrors _INTERPOLATION_RE in
-// the Python loader.
-var interpolationRE = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}`)
+// interpolationRE matches a `{{name}}` token in an executor arg.
+// Greedy match — `{{a}}stuff{{b}}` is two tokens. Mirrors
+// _INTERPOLATION_RE in the Python loader.
+//
+// Sprint follow-up S2.b.2 phase 2b extended ``name`` to allow
+// dotted identifiers (``{{pre_state.description}}``) so rollback
+// synthesis commands can reference pre-capture state. The lookup
+// is still a flat ``params[name]`` — the rollback executor
+// flattens ``pre_state["description"]`` into
+// ``params["pre_state.description"]`` before expansion, so this
+// regex change is the only signal-path edit. Existing single-
+// word interpolations (``{{interface_name}}``) keep working
+// unchanged.
+var interpolationRE = regexp.MustCompile(`\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\}\}`)
 
 // KALAction is the in-memory representation of a validated action. Mirrors
 // the Python dataclass. The full YAML map is preserved in Raw so the
@@ -316,6 +326,21 @@ func checkInterpolationCoverage(raw map[string]interface{}, p string) error {
 	checkString := func(s, where string) error {
 		for _, m := range interpolationRE.FindAllStringSubmatch(s, -1) {
 			name := m[1]
+			// Sprint follow-up S2.b.2 phase 2c: allowlist
+			// ``pre_state.<key>`` references. These resolve at
+			// runtime from the rollback command's pre_state
+			// payload (flattened into params under the
+			// ``pre_state.`` prefix by the rollback runner) and
+			// CAN'T be enumerated at YAML-load time — the keys
+			// depend on which fields the action's vendor parser
+			// happens to extract. Treating them as well-formed
+			// here is the right tradeoff: if the parser doesn't
+			// supply the key at runtime, the rollback fails with
+			// a clear error pointing at the missing pre_state
+			// field; if it does supply it, expansion succeeds.
+			if strings.HasPrefix(name, "pre_state.") {
+				continue
+			}
 			if _, ok := declared[name]; !ok {
 				return loadErrf(p,
 					"%s interpolation '{{%s}}' is not a declared parameter or parameter_transform",
